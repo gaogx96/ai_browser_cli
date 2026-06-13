@@ -267,7 +267,7 @@ const DOMAIN_BLACKLIST: &[&str] = &[
     "nsclick.baidu.com", "entry.baidu.com", "baidu.com/zt/",
     // Alibaba
     "tanx.com", "mmstat.com", "alicdn.com/s.gif", "taobao.com/go/",
-    "alimama.com", "tanx.com", "atpanel.com", "yimg.com",
+    "alimama.com", "atpanel.com", "yimg.com",
     // Tencent
     "beacon.qq.com", "pingtas.qq.com", "report.qqbrowser.com",
     "tdw.qq.com", "btrace.qq.com", "pingma.qq.com",
@@ -280,13 +280,11 @@ const DOMAIN_BLACKLIST: &[&str] = &[
     "segment.io", "segment.com", "api.segment.io",
     "mixpanel.com", "api.mixpanel.com",
     "amplitude.com", "api.amplitude.com",
-    // Hotjar / Clarity
-    "hotjar.com", "clarity.ms",
+    // Hotjar / Clarity / Bing
+    "hotjar.com", "clarity.ms", "bat.bing.com",
     // Sentry / NewRelic
     "sentry.io", "ingest.sentry.io",
     "newrelic.com", "nr-data.net", "bam.nr-data.net",
-    // Bing
-    "bat.bing.com", "clarity.ms",
     // Yandex
     "mc.yandex.ru", "yandex.ru/clck",
     // 1px tracking domains
@@ -710,6 +708,11 @@ impl BrowserState {
             Ok(guard) => guard.clone(),
             Err(_) => return,
         };
+
+        // C-11 fix: register ALL four event listeners to prevent
+        // unbounded memory growth from unconsumed events in the
+        // chromiumoxide event dispatcher channel.
+
         let tracker_req = Arc::clone(tracker);
         if let Ok(mut stream) = futures::executor::block_on(
             page.event_listener::<EventRequestWillBeSent>(),
@@ -720,6 +723,19 @@ impl BrowserState {
                 }
             });
         }
+
+        // C-11 fix: consume responseReceived events to prevent channel buildup
+        let tracker_resp = Arc::clone(tracker);
+        if let Ok(mut stream) = futures::executor::block_on(
+            page.event_listener::<EventResponseReceived>(),
+        ) {
+            tokio::spawn(async move {
+                while let Some(_event) = stream.next().await {
+                    let _ = &tracker_resp; // drain only, no counter change
+                }
+            });
+        }
+
         let tracker_fin = Arc::clone(tracker);
         if let Ok(mut stream) = futures::executor::block_on(
             page.event_listener::<EventLoadingFinished>(),
@@ -730,6 +746,7 @@ impl BrowserState {
                 }
             });
         }
+
         let tracker_fail = Arc::clone(tracker);
         if let Ok(mut stream) = futures::executor::block_on(
             page.event_listener::<EventLoadingFailed>(),
@@ -816,8 +833,14 @@ impl BrowserState {
 
             let count = match tokio::time::timeout(EVALUATE_TIMEOUT, page.evaluate(mark_script.as_str())).await {
                 Ok(Ok(result)) => result.value().and_then(|v| v.as_i64()).unwrap_or(0),
-                Ok(Err(_)) => continue,
-                Err(_) => continue,
+                Ok(Err(e)) => {
+                    eprintln!("[tree] Mark evaluate failed on frame {}: {}", frame_idx, e);
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("[tree] Mark evaluate timed out on frame {}", frame_idx);
+                    continue;
+                }
             };
 
             if count == 0 {

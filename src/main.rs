@@ -280,7 +280,11 @@ async fn cmd_listen(
     let mut line_buf = String::new();
 
     let exit_code = loop {
-        line_buf.clear();
+        // C-10 fix: do NOT clear at the top of the loop.
+        // read_line() appends to the buffer. If a partial read occurs
+        // (no newline found), the accumulated data must be preserved
+        // for the next read_line() call. The buffer is only cleared
+        // AFTER a complete line is processed (see end of arm).
 
         tokio::select! {
             biased;
@@ -292,24 +296,33 @@ async fn cmd_listen(
                         break 0;
                     }
                     Ok(_n) => {
+                        // C-10 fix: check accumulated buffer size,
+                        // not the bytes read in this single call.
                         if line_buf.len() > MAX_STDIN_LINE_BYTES {
                             eprintln!(
                                 "[stdin] Line too large ({} bytes, max {}), discarding",
                                 line_buf.len(), MAX_STDIN_LINE_BYTES
                             );
+                            line_buf.clear();
                             continue;
                         }
 
+                        // C-10 fix: if no newline, this is a partial read.
+                        // Keep the data in the buffer; next read_line() will
+                        // append more data until a newline is found.
                         if !line_buf.ends_with('\n') && !line_buf.ends_with('\r') {
                             continue;
                         }
 
-                        let trimmed = line_buf.trim();
+                        let trimmed = line_buf.trim().to_string();
+                        // C-10 fix: clear AFTER extracting the complete line.
+                        line_buf.clear();
+
                         if trimmed.is_empty() {
                             continue;
                         }
 
-                        let response = process_command(&bs, trimmed, &mut media_on).await;
+                        let response = process_command(&bs, &trimmed, &mut media_on).await;
                         let resp_json = match response {
                             Ok(data) => data,
                             Err(e) => json!({
