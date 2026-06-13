@@ -1,21 +1,22 @@
 mod browser;
 mod injector;
+mod prompt;
 mod utils;
+
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde_json::json;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use browser::{BrowserState, set_media_blocking_status};
-use utils::{spawn_stdin_reader, write_json_stdout};
+use utils::write_json_stdout;
 
 /// AI Agent Browser CLI - High-performance headless browser control via CDP.
-///
-/// Designed for AI agents (Python, TypeScript, etc.) to programmatically
-/// interact with web pages through stdin/stdout pipe communication.
 #[derive(Parser)]
 #[command(name = "agent-browser-cli")]
-#[command(version = "0.3.0")]
+#[command(version = "0.5.0")]
 #[command(about = "AI Agent headless browser CLI", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -30,9 +31,15 @@ enum Commands {
         #[arg(short, long)]
         url: String,
 
-        /// Chrome profile path for session reuse (e.g., C:\Users\You\AppData\...)
+        /// Chrome profile path for session reuse
         #[arg(short, long)]
         profile: Option<String>,
+
+        /// Connect to an existing Chrome instance via debugging port.
+        /// E.g., --connect http://127.0.0.1:9222
+        /// Chrome must be running with --remote-debugging-port=9222.
+        #[arg(long)]
+        connect: Option<String>,
 
         /// Show browser window (disable headless mode)
         #[arg(long, default_value = "false")]
@@ -40,26 +47,21 @@ enum Commands {
     },
 
     /// Persistent pipe mode: listen on stdin for JSON commands, respond on stdout.
-    ///
-    /// Commands format (one JSON per line):
-    ///   {"action": "navigate", "url": "https://..."}
-    ///   {"action": "click", "target_id": "e5"}
-    ///   {"action": "type", "target_id": "e3", "text": "hello"}
-    ///   {"action": "screenshot"}
-    ///   {"action": "configure", "media_enabled": true}
-    ///
-    /// Exits cleanly when stdin pipe is closed (parent process exits).
     Listen {
         /// Chrome profile path for session reuse
         #[arg(short, long)]
         profile: Option<String>,
+
+        /// Connect to an existing Chrome instance via debugging port.
+        /// E.g., --connect http://127.0.0.1:9222
+        #[arg(long)]
+        connect: Option<String>,
 
         /// Enable aggressive resource blocking (images, CSS, fonts, ads)
         #[arg(short, long, default_value = "true")]
         block_resources: bool,
 
         /// Start with media loading enabled (skip initial blocking).
-        /// Default false = aggressive blocking from the start.
         #[arg(long, default_value = "false")]
         media_enabled: bool,
 
@@ -67,45 +69,155 @@ enum Commands {
         #[arg(long, default_value = "false")]
         show: bool,
     },
+
+    /// Print the AI Agent system prompt to stdout and exit.
+    /// Use this to feed the prompt into your LLM pipeline.
+    Prompt,
 }
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_STDIN_LINE_BYTES: usize = 1024 * 1024;
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    let result = match cli.command {
-        Commands::View { url, profile, show } => cmd_view(&url, profile.as_deref(), show).await,
+    let exit_code = match cli.command {
+        Commands::Prompt => {
+            println!("{}", prompt::AGENT_SYSTEM_PROMPT);
+            0
+        }
+        Commands::View { url, profile, connect, show } => {
+            cmd_view(&url, profile.as_deref(), connect.as_deref(), show).await
+        }
         Commands::Listen {
             profile,
+            connect,
             block_resources,
             media_enabled,
             show,
-        } => cmd_listen(profile.as_deref(), block_resources, media_enabled, show).await,
+        } => {
+            cmd_listen(
+                profile.as_deref(),
+                connect.as_deref(),
+                block_resources,
+                media_enabled,
+                show,
+            )
+            .await
+        }
     };
 
-    // R-02 fix: NO process::exit() here. Normal return lets Drop run,
-    // which fires _shutdown_tx, cleanly stops the CDP handler, and
-    // the browser's Drop kills Chrome via kill_on_drop(true).
-    if let Err(e) = &result {
-        let error_json = json!({
-            "status": "error",
-            "error": format!("{:#}", e)
-        });
-        // Best-effort error output; if stdout is broken, just exit.
-        let _ = write_json_stdout(&error_json).await;
-        std::process::exit(1);
+    std::process::exit(exit_code);
+}
+
+async fn shutdown_browser(mut bs: BrowserState, context: &str) {
+    match tokio::time::timeout(SHUTDOWN_TIMEOUT, bs.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("[{}] Browser close error: {}", context, e);
+        }
+        Err(_) => {
+            eprintln!(
+                "[{}] Browser close timed out ({}s)",
+                context,
+                SHUTDOWN_TIMEOUT.as_secs()
+            );
+        }
     }
 }
 
-/// One-shot view: load URL, extract tree, print to stdout, exit.
-async fn cmd_view(url: &str, profile: Option<&str>, show: bool) -> Result<()> {
-    let mut bs = BrowserState::launch(profile, show).await?;
+/// Launch or connect to a browser based on the provided arguments.
+///
+/// Auto-detection logic:
+///   1. If --connect is explicitly provided, use that URL directly.
+///   2. Otherwise, probe 127.0.0.1:9222 with a 50ms TCP handshake.
+///      - If Chrome responds → auto-attach in connect mode (preserves sessions).
+///      - If no response → fall back to launch mode with anti-detection flags.
+async fn resolve_browser(
+    profile: Option<&str>,
+    connect: Option<&str>,
+    show: bool,
+) -> Result<BrowserState> {
+    // Case 1: explicit --connect flag
+    if let Some(url) = connect {
+        eprintln!("[connect] Connecting to existing Chrome at {}...", url);
+        return BrowserState::connect(url).await;
+    }
 
-    bs.enable_resource_blocking().await?;
-    bs.navigate(url).await?;
+    // Case 2: auto-detect Chrome on 9222 (50ms probe)
+    let probe = tokio::time::timeout(
+        Duration::from_millis(50),
+        tokio::net::TcpStream::connect("127.0.0.1:9222"),
+    )
+    .await;
 
-    let tree = bs.extract_tree().await?;
-    let meta = bs.get_page_meta().await?;
+    match probe {
+        Ok(Ok(_stream)) => {
+            // Port 9222 is open — a Chrome instance with remote debugging exists.
+            eprintln!("[Auto-Detect] Found active Chrome on port 9222. Attaching seamlessly...");
+            return BrowserState::connect("http://127.0.0.1:9222").await;
+        }
+        _ => {
+            // No Chrome on 9222 — fall through to launch mode.
+        }
+    }
+
+    // Case 3: fallback — launch a new Chrome with anti-detection hardening.
+    eprintln!("[Launch] No Chrome detected on port 9222. Starting hardened headless instance...");
+    BrowserState::launch(profile, show).await
+}
+
+async fn cmd_view(
+    url: &str,
+    profile: Option<&str>,
+    connect: Option<&str>,
+    show: bool,
+) -> i32 {
+    let bs = match resolve_browser(profile, connect, show).await {
+        Ok(bs) => bs,
+        Err(e) => {
+            let _ = write_json_stdout(&json!({
+                "status": "error",
+                "error": format!("{:#}", e)
+            }))
+            .await;
+            return 1;
+        }
+    };
+
+    if let Err(e) = bs.enable_resource_blocking().await {
+        let _ = write_json_stdout(&json!({
+            "status": "error",
+            "error": format!("{:#}", e)
+        }))
+        .await;
+        shutdown_browser(bs, "view").await;
+        return 1;
+    }
+
+    if let Err(e) = bs.navigate(url).await {
+        let _ = write_json_stdout(&json!({
+            "status": "error",
+            "error": format!("{:#}", e)
+        }))
+        .await;
+        shutdown_browser(bs, "view").await;
+        return 1;
+    }
+
+    let (tree, meta) = match (bs.extract_tree().await, bs.get_page_meta().await) {
+        (Ok(tree), Ok(meta)) => (tree, meta),
+        (Err(e), _) | (_, Err(e)) => {
+            let _ = write_json_stdout(&json!({
+                "status": "error",
+                "error": format!("{:#}", e)
+            }))
+            .await;
+            shutdown_browser(bs, "view").await;
+            return 1;
+        }
+    };
 
     let output = json!({
         "status": "ok",
@@ -115,110 +227,153 @@ async fn cmd_view(url: &str, profile: Option<&str>, show: bool) -> Result<()> {
         "tree": tree,
     });
 
-    write_json_stdout(&output).await?;
-    // R-16 fix: propagate close errors
-    bs.close().await?;
-
-    Ok(())
+    let write_ok = write_json_stdout(&output).await.is_ok();
+    shutdown_browser(bs, "view").await;
+    if write_ok { 0 } else { 1 }
 }
 
-/// Persistent listen mode: stdin/stdout pipe communication.
-///
-/// Architecture:
-/// - Stdin is read via `spawn_blocking` to avoid starving the tokio runtime
-/// - Stdout is written via `spawn_blocking` to avoid pipe-buffer blocking
-/// - The background CDP event handler has a shutdown channel
-/// - R-02 fix: NO process::exit(). All paths return Result, letting Drop
-///   clean up the browser and fire the shutdown channel.
 async fn cmd_listen(
     profile: Option<&str>,
+    connect: Option<&str>,
     block_resources: bool,
     media_enabled: bool,
     show: bool,
-) -> Result<()> {
-    let mut bs = BrowserState::launch(profile, show).await?;
+) -> i32 {
+    let bs = match resolve_browser(profile, connect, show).await {
+        Ok(bs) => bs,
+        Err(e) => {
+            let _ = write_json_stdout(&json!({
+                "status": "error",
+                "error": format!("{:#}", e)
+            }))
+            .await;
+            return 1;
+        }
+    };
 
-    // Apply initial blocking policy
     if block_resources && !media_enabled {
-        bs.enable_resource_blocking().await?;
+        if let Err(e) = bs.enable_resource_blocking().await {
+            let _ = write_json_stdout(&json!({
+                "status": "error",
+                "error": format!("{:#}", e)
+            }))
+            .await;
+            shutdown_browser(bs, "listen").await;
+            return 1;
+        }
     }
 
     let mut media_on = media_enabled;
 
-    // Send ready signal
     let ready = json!({
         "status": "ready",
         "media_enabled": media_on,
         "message": "agent-browser-cli is listening"
     });
-    write_json_stdout(&ready).await?;
+    if write_json_stdout(&ready).await.is_err() {
+        shutdown_browser(bs, "listen").await;
+        return 1;
+    }
 
-    // Spawn async stdin reader (non-blocking)
-    let mut stdin_rx = spawn_stdin_reader();
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let mut line_buf = String::new();
 
-    // Main command loop — all I/O is async, no thread starvation
-    loop {
-        let line = match stdin_rx.recv().await {
-            Some(line) => line,
-            None => {
-                // R-02 fix: return Ok instead of process::exit(0).
-                // bs is dropped here → _shutdown_tx fires → handler exits → browser killed.
-                eprintln!("[listen] Stdin closed. Shutting down...");
-                bs.close().await.ok(); // best-effort close
-                return Ok(());
+    let exit_code = loop {
+        line_buf.clear();
+
+        tokio::select! {
+            biased;
+
+            read_result = reader.read_line(&mut line_buf) => {
+                match read_result {
+                    Ok(0) => {
+                        eprintln!("[listen] Stdin closed. Shutting down...");
+                        break 0;
+                    }
+                    Ok(_n) => {
+                        if line_buf.len() > MAX_STDIN_LINE_BYTES {
+                            eprintln!(
+                                "[stdin] Line too large ({} bytes, max {}), discarding",
+                                line_buf.len(), MAX_STDIN_LINE_BYTES
+                            );
+                            continue;
+                        }
+
+                        if !line_buf.ends_with('\n') && !line_buf.ends_with('\r') {
+                            continue;
+                        }
+
+                        let trimmed = line_buf.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+
+                        let response = process_command(&bs, trimmed, &mut media_on).await;
+                        let resp_json = match response {
+                            Ok(data) => data,
+                            Err(e) => json!({
+                                "status": "error",
+                                "error": format!("{:#}", e)
+                            }),
+                        };
+
+                        if write_json_stdout(&resp_json).await.is_err() {
+                            eprintln!("[listen] Stdout write failed. Shutting down...");
+                            break 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[stdin] Read error: {}", e);
+                        break 1;
+                    }
+                }
             }
-        };
-
-        if line.is_empty() {
-            continue;
-        }
-
-        let cmd: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                let err_resp = json!({
-                    "status": "error",
-                    "error": format!("Invalid JSON: {}", e)
-                });
-                write_json_stdout(&err_resp).await?;
-                continue;
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("[listen] Ctrl+C received. Shutting down...");
+                break 0;
             }
-        };
-
-        let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
-
-        let response = match action {
-            "navigate" => handle_navigate(&bs, &cmd).await,
-            "click" => handle_click(&bs, &cmd).await,
-            "type" => handle_type(&bs, &cmd).await,
-            "screenshot" => handle_screenshot(&bs).await,
-            "tree" => handle_tree(&bs).await,
-            "meta" => handle_meta(&bs).await,
-            "configure" => handle_configure(&bs, &cmd, &mut media_on).await,
-            "" => Err(anyhow::anyhow!("Missing 'action' field")),
-            _ => Err(anyhow::anyhow!("Unknown action: '{}'", action)),
-        };
-
-        let resp_json = match response {
-            Ok(data) => data,
-            Err(e) => json!({
-                "status": "error",
-                "error": format!("{:#}", e)
-            }),
-        };
-
-        if write_json_stdout(&resp_json).await.is_err() {
-            // R-02 fix: return instead of process::exit(1)
-            eprintln!("[listen] Stdout write failed. Shutting down...");
-            bs.close().await.ok();
-            return Err(anyhow::anyhow!("stdout write failed"));
         }
+    };
+
+    shutdown_browser(bs, "listen").await;
+    exit_code
+}
+
+async fn process_command(
+    bs: &BrowserState,
+    line: &str,
+    media_on: &mut bool,
+) -> Result<serde_json::Value> {
+    let cmd: serde_json::Value = serde_json::from_str(line)
+        .map_err(|e| anyhow::anyhow!("Invalid JSON: {}", e))?;
+
+    let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+    match action {
+        "get_prompt" => Ok(json!({
+            "status": "ok",
+            "action": "get_prompt",
+            "prompt": prompt::AGENT_SYSTEM_PROMPT,
+        })),
+        "navigate" => handle_navigate(bs, &cmd).await,
+        "click" => handle_click(bs, &cmd).await,
+        "type" => handle_type(bs, &cmd).await,
+        "screenshot" => handle_screenshot(bs).await,
+        "tree" => handle_tree(bs).await,
+        "meta" => handle_meta(bs).await,
+        "configure" => handle_configure(bs, &cmd, media_on).await,
+        "" => Err(anyhow::anyhow!("Missing 'action' field")),
+        _ => Err(anyhow::anyhow!("Unknown action: '{}'", action)),
     }
 }
 
 // ─── Command handlers ───────────────────────────────────────────────────
 
-async fn handle_navigate(bs: &BrowserState, cmd: &serde_json::Value) -> Result<serde_json::Value> {
+async fn handle_navigate(
+    bs: &BrowserState,
+    cmd: &serde_json::Value,
+) -> Result<serde_json::Value> {
     let url = cmd
         .get("url")
         .and_then(|v| v.as_str())

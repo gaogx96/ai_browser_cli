@@ -1,62 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::fs;
-use tokio::sync::mpsc;
 
-// ─── Constants ──────────────────────────────────────────────────────────
-
-/// Maximum single line length from stdin (1 MB). Prevents OOM from malformed input.
-const MAX_STDIN_LINE_BYTES: usize = 1024 * 1024;
-
-// ─── Async-safe stdin reader ────────────────────────────────────────────
-
-/// Spawn a blocking stdin reader that feeds lines through an async mpsc channel.
-///
-/// Returns a receiver that yields `Some(line)` for each stdin line,
-/// and `None` when stdin is closed (EOF / pipe broken).
-///
-/// Lines exceeding [`MAX_STDIN_LINE_BYTES`] are discarded with an error log.
-pub fn spawn_stdin_reader() -> mpsc::Receiver<String> {
-    let (tx, rx) = mpsc::channel::<String>(64); // bounded backpressure
-
-    tokio::task::spawn_blocking(move || {
-        use std::io::{self, BufRead};
-        let stdin = io::stdin();
-
-        loop {
-            let mut line = String::new();
-            match stdin.lock().read_line(&mut line) {
-                Ok(0) => {
-                    // EOF — parent process closed the pipe
-                    break;
-                }
-                Ok(_) => {
-                    // R-10 fix: reject oversized lines
-                    if line.len() > MAX_STDIN_LINE_BYTES {
-                        eprintln!(
-                            "[stdin] Line too large ({} bytes, max {}), discarding",
-                            line.len(),
-                            MAX_STDIN_LINE_BYTES
-                        );
-                        continue;
-                    }
-                    let trimmed = line.trim().to_string();
-                    if tx.blocking_send(trimmed).is_err() {
-                        // Receiver dropped — main loop exited
-                        break;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[stdin] Read error (pipe broken): {}", e);
-                    break;
-                }
-            }
-        }
-        // tx drops here, receiver will get None
-    });
-
-    rx
-}
+// M-03 fix: spawn_stdin_reader removed.
+// Stdin is now read via async tokio::io::BufReader in main.rs.
+// No more spawn_blocking threads blocking on stdin.lock().read_line().
 
 // ─── Async-safe stdout writer ───────────────────────────────────────────
 
@@ -82,18 +30,30 @@ pub async fn write_json_stdout(value: &serde_json::Value) -> Result<()> {
 ///
 /// Uses millisecond timestamp + 4-digit random suffix to prevent collisions.
 /// R-12 fix: uses exe directory instead of CWD for deterministic paths.
+/// L-01 fix: falls back to temp directory if exe_dir is not writable.
 pub fn save_screenshot(png_data: &[u8]) -> Result<String> {
-    let exe_dir = std::env::current_exe()
-        .context("Failed to get executable path")?
-        .parent()
-        .context("Failed to get executable directory")?
-        .to_path_buf();
-    let dump_dir = exe_dir.join("debug_dumps");
-
-    if !dump_dir.exists() {
-        fs::create_dir_all(&dump_dir)
-            .with_context(|| format!("Failed to create directory: {}", dump_dir.display()))?;
-    }
+    // Try exe directory first, fall back to temp dir if not writable
+    let dump_dir = match std::env::current_exe() {
+        Ok(exe_path) => {
+            let dir = exe_path.parent().unwrap_or(std::path::Path::new(".")).join("debug_dumps");
+            // Test writability by attempting to create the directory
+            if ensure_dir_writable(&dir).is_ok() {
+                dir
+            } else {
+                // L-01 fix: fallback to temp directory
+                let tmp = std::env::temp_dir().join("agent-browser-cli").join("debug_dumps");
+                ensure_dir_writable(&tmp)
+                    .with_context(|| format!("Cannot write to fallback directory: {}", tmp.display()))?;
+                tmp
+            }
+        }
+        Err(_) => {
+            let tmp = std::env::temp_dir().join("agent-browser-cli").join("debug_dumps");
+            ensure_dir_writable(&tmp)
+                .with_context(|| format!("Cannot write to fallback directory: {}", tmp.display()))?;
+            tmp
+        }
+    };
 
     let timestamp = Utc::now().timestamp_millis();
     let nonce: u16 = rand::random();
@@ -104,6 +64,24 @@ pub fn save_screenshot(png_data: &[u8]) -> Result<String> {
         .with_context(|| format!("Failed to write screenshot to {}", file_path.display()))?;
 
     Ok(file_path.to_string_lossy().to_string())
+}
+
+/// Ensure a directory exists and is writable. Creates it if it doesn't exist.
+fn ensure_dir_writable(dir: &std::path::Path) -> Result<()> {
+    if !dir.exists() {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
+    }
+    // Verify writability by checking directory metadata on Windows
+    #[cfg(windows)]
+    {
+        let metadata = fs::metadata(dir)
+            .with_context(|| format!("Cannot read directory metadata: {}", dir.display()))?;
+        if metadata.permissions().readonly() {
+            anyhow::bail!("Directory is read-only: {}", dir.display());
+        }
+    }
+    Ok(())
 }
 
 // ─── JS string escaping ─────────────────────────────────────────────────
@@ -149,5 +127,16 @@ mod tests {
         assert_eq!(escape_js_string("a\\b"), "a\\\\b");
         assert_eq!(escape_js_string("a`b"), "a\\`b");
         assert_eq!(escape_js_string("null\0byte"), "null\\0byte");
+    }
+
+    #[test]
+    fn test_escape_js_string_unicode_separators() {
+        assert_eq!(escape_js_string("a\u{2028}b"), "a\\u2028b");
+        assert_eq!(escape_js_string("a\u{2029}b"), "a\\u2029b");
+    }
+
+    #[test]
+    fn test_escape_js_string_empty() {
+        assert_eq!(escape_js_string(""), "");
     }
 }

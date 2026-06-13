@@ -1,6 +1,6 @@
 [package]
 name = "agent-browser-cli"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2021"
 description = "AI Agent browser CLI - high-performance headless browser control via CDP"
 license = "MIT"
@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 chromiumoxide = { version = "0.5", features = ["tokio-runtime"] }
+# M-02/M-05 fix: direct dependency for CDP event types (Network events, Target events)
+chromiumoxide_cdp = "0.5"
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -3,64 +3,10 @@
 /// All scripts are self-contained IIFEs that do not pollute the global scope.
 /// External parameters are passed through placeholder tokens that MUST be
 /// sanitized by the Rust caller before injection (see `utils::escape_js_string`).
-
-/// Mark all visible interactive elements with unique `data-agent-id` attributes.
 ///
-/// Visibility filter logic:
-/// 1. `getBoundingClientRect()` — zero-size check
-/// 2. `getComputedStyle()` — display/visibility/opacity
-/// 3. `offsetParent` — BUT fixed-position elements are explicitly allowed
-///    (offsetParent is null for fixed elements, which the old code incorrectly skipped)
-pub const INJECT_MARK_SCRIPT: &str = r#"
-(() => {
-    // Remove previous marks
-    document.querySelectorAll('[data-agent-id]').forEach(el => {
-        el.removeAttribute('data-agent-id');
-    });
-
-    const SELECTORS = [
-        'button', 'a[href]', 'input', 'textarea', 'select',
-        '[role="button"]', '[role="link"]', '[role="checkbox"]',
-        '[role="radio"]', '[role="tab"]', '[role="menuitem"]',
-        '[role="option"]', '[role="switch"]', '[role="slider"]',
-        '[onclick]', '[tabindex]:not([tabindex="-1"])',
-        'details', 'summary', 'label[for]'
-    ];
-
-    const candidates = new Set();
-    for (const sel of SELECTORS) {
-        for (const el of document.querySelectorAll(sel)) {
-            candidates.add(el);
-        }
-    }
-
-    let counter = 0;
-    for (const el of candidates) {
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-
-        // Filter hidden elements
-        if (rect.width === 0 && rect.height === 0) continue;
-        if (style.display === 'none') continue;
-        if (style.visibility === 'hidden') continue;
-        if (parseFloat(style.opacity) === 0) continue;
-
-        // offsetParent is null for:
-        //   - position: fixed (VALID — must not skip)
-        //   - display: none (already caught above)
-        //   - body element
-        // So we only skip if offsetParent is null AND position is NOT fixed
-        if (el.tagName !== 'BODY' && el.offsetParent === null) {
-            if (style.position !== 'fixed') continue;
-        }
-
-        counter++;
-        el.setAttribute('data-agent-id', 'e' + counter);
-    }
-
-    return counter;
-})()
-"#;
+/// M-05 fix: INJECT_MARK_SCRIPT has been moved inline into browser.rs's
+/// extract_tree() to support a global offset parameter for multi-frame
+/// element numbering (e.g., frame-0 elements: e1-e50, frame-1: e51-e100).
 
 /// Extract a simplified accessibility tree from marked elements.
 ///
@@ -280,92 +226,6 @@ pub const HUMAN_TYPE_SCRIPT: &str = r#"
 })()
 "#;
 
-/// Network idle detection — IDEMPOTENT version.
-///
-/// Each invocation first unhooks any previous XMLHttpRequest/fetch overrides
-/// before installing fresh hooks. This prevents hook accumulation across
-/// multiple navigate/call cycles.
-///
-/// Algorithm:
-/// 1. Hook XHR.send and fetch to track active request count
-/// 2. When count reaches 0, start a 500ms idle timer
-/// 3. If a new request starts during the idle window, cancel and reset
-/// 4. Hard timeout at 10 seconds — resolves `false` to prevent permanent hang
-///
-/// Returns `true` if idle achieved, `false` on timeout.
-pub const WAIT_FOR_IDLE_SCRIPT: &str = r#"
-(() => {
-    return new Promise((resolve) => {
-        // ── Unhook previous installation (idempotency) ──
-        if (window.__agent_idle_cleanup) {
-            window.__agent_idle_cleanup();
-        }
-
-        let active = 0;
-        let idleTimer = null;
-        let settled = false;
-        const IDLE_MS = 500;
-        const TIMEOUT_MS = 10000;
-
-        function scheduleIdle() {
-            if (settled) return;
-            if (idleTimer) clearTimeout(idleTimer);
-            if (active <= 0) {
-                idleTimer = setTimeout(() => {
-                    if (!settled) { settled = true; cleanup(); resolve(true); }
-                }, IDLE_MS);
-            }
-        }
-
-        function onActive() {
-            if (settled) return;
-            active++;
-            if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-        }
-
-        function onDone() {
-            if (settled) return;
-            active = Math.max(0, active - 1);
-            scheduleIdle();
-        }
-
-        // ── Hook XMLHttpRequest ──
-        const OrigXHR = window.XMLHttpRequest;
-        const origOpen = OrigXHR.prototype.open;
-        const origSend = OrigXHR.prototype.send;
-
-        OrigXHR.prototype.send = function() {
-            onActive();
-            this.addEventListener('loadend', onDone);
-            return origSend.apply(this, arguments);
-        };
-
-        // ── Hook fetch ──
-        const origFetch = window.fetch;
-        window.fetch = function() {
-            onActive();
-            return origFetch.apply(this, arguments).then(
-                r => { onDone(); return r; },
-                e => { onDone(); throw e; }
-            );
-        };
-
-        // ── Cleanup function for next invocation ──
-        function cleanup() {
-            try { OrigXHR.prototype.open = origOpen; } catch(e) {}
-            try { OrigXHR.prototype.send = origSend; } catch(e) {}
-            try { window.fetch = origFetch; } catch(e) {}
-            if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-        }
-        window.__agent_idle_cleanup = cleanup;
-
-        // ── Start ──
-        scheduleIdle();
-
-        // Hard timeout
-        setTimeout(() => {
-            if (!settled) { settled = true; cleanup(); resolve(false); }
-        }, TIMEOUT_MS);
-    });
-})()
-"#;
+// M-02 fix: WAIT_FOR_IDLE_SCRIPT removed.
+// Network idle detection now uses CDP Network domain events in Rust,
+// which cannot be spoofed by page JavaScript. See browser.rs NetworkIdleTracker.
