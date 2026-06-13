@@ -1037,14 +1037,79 @@ impl BrowserState {
         let scroll_script = smart_scroll_script(safe_agent_id);
         let page = lock_with_timeout(&self.page, "page").await?.clone();
         let result = evaluate_with_timeout(&page, &scroll_script).await?;
-        let scrolled = result
-            .value()
+        let value = result.value();
+
+        let scrolled = value
             .and_then(|v| v.get("scrolled").and_then(|s| s.as_bool()))
             .unwrap_or(false);
-        if scrolled {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let cross_frame = value
+            .and_then(|v| v.get("crossFrame").and_then(|s| s.as_bool()))
+            .unwrap_or(false);
+
+        let cross_origin_fallback = value
+            .and_then(|v| v.get("crossOriginFallback").and_then(|s| s.as_bool()))
+            .unwrap_or(false);
+
+        if cross_origin_fallback {
+            // Cross-origin iframe: JS couldn't access parent frame.
+            // Fall back to CDP: scroll the iframe element in the main page.
+            self.scroll_iframe_into_view_via_cdp(safe_agent_id).await;
         }
+
+        if scrolled {
+            // Dynamic delay: cross-frame scrolling involves multiple viewports
+            // and CSS animations, needs more time on Windows Chromium.
+            let delay = if cross_frame { 700 } else { 500 };
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
         Ok(scrolled)
+    }
+
+    /// Cross-origin fallback: use CDP to scroll the iframe element
+    /// into view within the main page when JS cannot access parent frames.
+    async fn scroll_iframe_into_view_via_cdp(&self, safe_agent_id: &str) {
+        // Get all pages; find the one that contains our target element
+        let all_pages = match cdp_op_with_timeout(self.browser.pages(), "pages_for_scroll").await {
+            Ok(pages) => pages,
+            Err(_) => return,
+        };
+
+        // For each page, try to find an iframe that contains our target
+        // by checking if the page has a frame with our target_id
+        for page in &all_pages {
+            let scroll_parent_script = format!(
+                r#"
+                (() => {{
+                    // Find all iframes in this document
+                    const iframes = document.querySelectorAll('iframe');
+                    for (const iframe of iframes) {{
+                        try {{
+                            const doc = iframe.contentDocument;
+                            if (doc && doc.querySelector('[data-agent-id="{}"]')) {{
+                                iframe.scrollIntoView({{ block: 'center', behavior: 'smooth' }});
+                                return true;
+                            }}
+                        }} catch (e) {{
+                            // Cross-origin — skip
+                        }}
+                    }}
+                    return false;
+                }})()
+                "#,
+                safe_agent_id
+            );
+
+            match tokio::time::timeout(EVALUATE_TIMEOUT, page.evaluate(scroll_parent_script.as_str())).await {
+                Ok(Ok(result)) => {
+                    if result.value().and_then(|v| v.as_bool()).unwrap_or(false) {
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
     }
 
     pub async fn get_page_meta(&self) -> Result<serde_json::Value> {

@@ -92,13 +92,16 @@ pub const EXTRACT_TREE_SCRIPT: &str = r#"
 })()
 "#;
 
-/// Smart smooth scroll: check if element is in viewport, scroll to center if not.
+/// Smart smooth scroll with cross-frame upward traversal.
 ///
-/// Uses CSS.escape() + template literal for the agent-id selector.
-/// Returns `{ scrolled, inView }`.
+/// Algorithm:
+///   1. Find the target element in the current frame and scrollIntoView.
+///   2. Walk up window.parent chain, scrolling each iframe container
+///      into view in its parent frame.
+///   3. On cross-origin SecurityError, fall back to a flag so the Rust
+///      layer can use CDP to scroll the parent frame externally.
 ///
-/// The `agent_id` value MUST be pre-escaped by the Rust caller (`escape_js_string`).
-/// CSS.escape() provides a second defense layer against selector injection.
+/// Returns `{ scrolled, inView, crossFrame, crossOriginFallback }`.
 pub fn smart_scroll_script(agent_id_escaped: &str) -> String {
     format!(
         r#"
@@ -107,20 +110,67 @@ pub fn smart_scroll_script(agent_id_escaped: &str) -> String {
     const el = document.querySelector(`[data-agent-id="${{id}}"]`);
     if (!el) return {{ scrolled: false, inView: false, error: 'element not found' }};
 
-    const rect = el.getBoundingClientRect();
-    const vh = window.innerHeight;
-    const vw = window.innerWidth;
-
-    const inView = (
-        rect.top >= 0 && rect.left >= 0 &&
-        rect.bottom <= vh && rect.right <= vw &&
-        rect.height > 0 && rect.width > 0
-    );
-
-    if (inView) return {{ scrolled: false, inView: true }};
-
+    // ── Step 1: scroll element into view within its own frame ──
     el.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
-    return {{ scrolled: true, inView: false }};
+
+    // ── Step 2: check if element is in the top-level viewport ──
+    function isInTopViewport(elem) {{
+        let rect = elem.getBoundingClientRect();
+        // Walk up through frames to get cumulative offset
+        let win = window;
+        let top = rect.top;
+        let left = rect.left;
+        while (win !== win.top) {{
+            try {{
+                const frameEl = win.frameElement;
+                if (!frameEl) break;
+                const frameRect = frameEl.getBoundingClientRect();
+                top += frameRect.top;
+                left += frameRect.left;
+                win = win.parent;
+            }} catch (e) {{
+                // Cross-origin — cannot compute top-level position
+                break;
+            }}
+        }}
+        return (
+            top >= 0 && left >= 0 &&
+            top < win.innerHeight && left < win.innerWidth &&
+            rect.height > 0 && rect.width > 0
+        );
+    }}
+
+    if (isInTopViewport(el)) {{
+        return {{ scrolled: true, inView: true, crossFrame: false, crossOriginFallback: false }};
+    }}
+
+    // ── Step 3: walk up the frame chain, scrolling each iframe into view ──
+    let currentWin = window;
+    let scrolledFrames = 0;
+    let crossOriginFallback = false;
+
+    while (currentWin !== currentWin.top) {{
+        try {{
+            const frameEl = currentWin.frameElement;
+            if (!frameEl) break;
+
+            // Scroll the iframe element into view within the parent frame
+            frameEl.scrollIntoView({{ block: 'center', inline: 'nearest', behavior: 'smooth' }});
+            scrolledFrames++;
+            currentWin = currentWin.parent;
+        }} catch (e) {{
+            // SecurityError: cross-origin iframe, cannot access frameElement
+            crossOriginFallback = true;
+            break;
+        }}
+    }}
+
+    return {{
+        scrolled: scrolledFrames > 0 || true,
+        inView: false,
+        crossFrame: scrolledFrames > 0,
+        crossOriginFallback: crossOriginFallback
+    }};
 }})()
 "#,
         agent_id_escaped
