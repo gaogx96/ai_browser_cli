@@ -700,23 +700,22 @@ impl BrowserState {
         }
     }
 
-    fn spawn_network_listeners_static(
+    /// Register network event listeners on a new page (e.g. after tab switch).
+    /// Hermes #1 fix: fully async — no futures::executor::block_on.
+    async fn spawn_network_listeners_static(
         page: &Arc<Mutex<Page>>,
         tracker: &Arc<NetworkIdleTracker>,
     ) {
-        let page = match page.try_lock() {
+        let page = match lock_with_timeout(page, "page").await {
             Ok(guard) => guard.clone(),
-            Err(_) => return,
+            Err(e) => {
+                eprintln!("[idle] Cannot acquire page for network listeners: {}", e);
+                return;
+            }
         };
 
-        // C-11 fix: register ALL four event listeners to prevent
-        // unbounded memory growth from unconsumed events in the
-        // chromiumoxide event dispatcher channel.
-
         let tracker_req = Arc::clone(tracker);
-        if let Ok(mut stream) = futures::executor::block_on(
-            page.event_listener::<EventRequestWillBeSent>(),
-        ) {
+        if let Ok(mut stream) = page.event_listener::<EventRequestWillBeSent>().await {
             tokio::spawn(async move {
                 while let Some(event) = stream.next().await {
                     tracker_req.on_request_start(&event.request.url, &event.r#type);
@@ -724,22 +723,17 @@ impl BrowserState {
             });
         }
 
-        // C-11 fix: consume responseReceived events to prevent channel buildup
         let tracker_resp = Arc::clone(tracker);
-        if let Ok(mut stream) = futures::executor::block_on(
-            page.event_listener::<EventResponseReceived>(),
-        ) {
+        if let Ok(mut stream) = page.event_listener::<EventResponseReceived>().await {
             tokio::spawn(async move {
                 while let Some(_event) = stream.next().await {
-                    let _ = &tracker_resp; // drain only, no counter change
+                    let _ = &tracker_resp;
                 }
             });
         }
 
         let tracker_fin = Arc::clone(tracker);
-        if let Ok(mut stream) = futures::executor::block_on(
-            page.event_listener::<EventLoadingFinished>(),
-        ) {
+        if let Ok(mut stream) = page.event_listener::<EventLoadingFinished>().await {
             tokio::spawn(async move {
                 while let Some(_event) = stream.next().await {
                     tracker_fin.on_request_done();
@@ -748,9 +742,7 @@ impl BrowserState {
         }
 
         let tracker_fail = Arc::clone(tracker);
-        if let Ok(mut stream) = futures::executor::block_on(
-            page.event_listener::<EventLoadingFailed>(),
-        ) {
+        if let Ok(mut stream) = page.event_listener::<EventLoadingFailed>().await {
             tokio::spawn(async move {
                 while let Some(_event) = stream.next().await {
                     tracker_fail.on_request_done();
@@ -1092,7 +1084,8 @@ impl BrowserState {
             .map(|p| p.target_id().as_ref().to_string())
             .collect();
 
-        let new_tab_id = {
+        // Hermes #8 fix: collect ALL new tab IDs, not just the first one.
+        let new_tab_ids: Vec<String> = {
             let mut known = match lock_with_timeout(&self.known_pages, "known_pages").await {
                 Ok(guard) => guard,
                 Err(e) => {
@@ -1100,12 +1093,13 @@ impl BrowserState {
                     return;
                 }
             };
-            let new_id = current_ids.difference(&*known).next().cloned();
+            let new_ids: Vec<String> = current_ids.difference(&*known).cloned().collect();
             *known = current_ids;
-            new_id
+            new_ids
         };
 
-        if let Some(new_id) = &new_tab_id {
+        // Focus the last new tab (most likely the one the user cares about)
+        if let Some(new_id) = new_tab_ids.last() {
             if let Some(new_page) = current_pages
                 .iter()
                 .find(|p| p.target_id().as_ref() == new_id.as_str())
@@ -1114,7 +1108,8 @@ impl BrowserState {
                 if let Ok(mut active) = lock_with_timeout(&self.page, "page").await {
                     *active = new_page.clone();
                 }
-                Self::spawn_network_listeners_static(&self.page, &self.idle_tracker);
+                // Hermes #1 fix: async call, no block_on
+                Self::spawn_network_listeners_static(&self.page, &self.idle_tracker).await;
             }
         }
     }
@@ -1133,9 +1128,11 @@ impl BrowserState {
             .map(|p| p.target_id().as_ref().to_string())
             .collect();
 
-        let new_tab_id = current_ids.difference(known_before).next().cloned();
+        // Hermes #8 fix: collect ALL new tab IDs, not just the first one.
+        let new_tab_ids: Vec<String> = current_ids.difference(known_before).cloned().collect();
 
-        if let Some(new_id) = &new_tab_id {
+        // Focus the last new tab (most likely the one the user cares about)
+        if let Some(new_id) = new_tab_ids.last() {
             if let Some(new_page) = current_pages
                 .iter()
                 .find(|p| p.target_id().as_ref() == new_id.as_str())
@@ -1144,7 +1141,8 @@ impl BrowserState {
                 if let Ok(mut active) = lock_with_timeout(&self.page, "page").await {
                     *active = new_page.clone();
                 }
-                Self::spawn_network_listeners_static(&self.page, &self.idle_tracker);
+                // Hermes #1 fix: async call, no block_on
+                Self::spawn_network_listeners_static(&self.page, &self.idle_tracker).await;
             }
         }
 

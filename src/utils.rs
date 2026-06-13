@@ -56,8 +56,9 @@ pub fn save_screenshot(png_data: &[u8]) -> Result<String> {
     };
 
     let timestamp = Utc::now().timestamp_millis();
-    let nonce: u16 = rand::random();
-    let filename = format!("agent_capture_{:04x}_{}.png", nonce & 0xFFFF, timestamp);
+    // Hermes #16 fix: u32 nonce (4 billion possibilities) instead of u16 (65536)
+    let nonce: u32 = rand::random();
+    let filename = format!("agent_capture_{:08x}_{}.png", nonce, timestamp);
     let file_path = dump_dir.join(&filename);
 
     fs::write(&file_path, png_data)
