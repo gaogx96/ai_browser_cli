@@ -1,6 +1,6 @@
 {
   "name": "agent-browser-client",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "TypeScript/Node.js client for agent-browser-cli",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
