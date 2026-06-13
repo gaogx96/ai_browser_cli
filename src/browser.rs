@@ -252,6 +252,32 @@ impl BrowserState {
             }
         }
 
+        // CRITICAL FIX: spawn the CDP handler BEFORE any CDP commands.
+        // browser.pages() and browser.new_page() send CDP commands through
+        // a channel that the handler processes. If the handler isn't running,
+        // these calls deadlock.
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    event = handler.next() => {
+                        match event {
+                            Some(Ok(_)) => {
+                                // Handler processed an event successfully.
+                            }
+                            Some(Err(e)) => eprintln!("[cdp] {}", e),
+                            None => break,
+                        }
+                    }
+                    _ = shutdown_rx.recv() => break,
+                }
+            }
+        });
+
+        // Allow the handler a moment to establish the CDP websocket connection
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
         let initial_pages = browser.pages().await.unwrap_or_default();
         let known_ids: HashSet<String> = initial_pages
             .iter()
@@ -272,25 +298,6 @@ impl BrowserState {
                 .await
                 .context("Failed to enable network domain")?;
         }
-
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    event = handler.next() => {
-                        match event {
-                            Some(Ok(_)) => {
-                                // Handler processed an event successfully.
-                            }
-                            Some(Err(e)) => eprintln!("[cdp] {}", e),
-                            None => break,
-                        }
-                    }
-                    _ = shutdown_rx.recv() => break,
-                }
-            }
-        });
 
         Ok(Self {
             browser,
@@ -325,7 +332,6 @@ impl BrowserState {
         }
 
         // page is dropped here (lock was already released by clone)
-        // R-08 fix: Rust-side timeout wraps the JS idle detection
         self.wait_for_idle().await;
         self.detect_new_tab().await;
         Ok(())
