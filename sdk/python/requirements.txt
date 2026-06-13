@@ -1,0 +1,3 @@
+# Agent Browser Client - Python SDK
+# No external dependencies required - uses only stdlib (asyncio, json)
+# Requires Python 3.8+

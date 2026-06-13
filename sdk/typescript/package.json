@@ -1,0 +1,19 @@
+{
+  "name": "agent-browser-client",
+  "version": "0.1.0",
+  "description": "TypeScript/Node.js client for agent-browser-cli",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "node dist/index.js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  }
+}
