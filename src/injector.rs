@@ -197,26 +197,41 @@ pub const HUMAN_TYPE_SCRIPT: &str = r#"
 
             const ch = chars[i];
             const delay = delays[i] || 30;
-            const code = keyCode(ch);
             i++;
 
-            el.dispatchEvent(new KeyboardEvent('keydown', {
-                key: ch, code: code, bubbles: true, cancelable: true
-            }));
-            el.dispatchEvent(new KeyboardEvent('keypress', {
-                key: ch, code: code, bubbles: true, cancelable: true
-            }));
-
-            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-                el.value += ch;
-            } else if (el.isContentEditable) {
-                el.textContent += ch;
+            // Hermes #13 fix: non-ASCII chars (CJK, emoji) use InputEvent
+            // instead of KeyboardEvent. This correctly triggers Vue/React
+            // reactivity for IME-style input without relying on code field.
+            if (ch.charCodeAt(0) > 127) {
+                el.dispatchEvent(new InputEvent('beforeinput', {
+                    inputType: 'insertText', data: ch, bubbles: true, cancelable: true
+                }));
+                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                    el.value += ch;
+                } else if (el.isContentEditable) {
+                    el.textContent += ch;
+                }
+                el.dispatchEvent(new InputEvent('input', {
+                    inputType: 'insertText', data: ch, bubbles: true
+                }));
+            } else {
+                const code = keyCode(ch);
+                el.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: ch, code: code, bubbles: true, cancelable: true
+                }));
+                el.dispatchEvent(new KeyboardEvent('keypress', {
+                    key: ch, code: code, bubbles: true, cancelable: true
+                }));
+                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                    el.value += ch;
+                } else if (el.isContentEditable) {
+                    el.textContent += ch;
+                }
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new KeyboardEvent('keyup', {
+                    key: ch, code: code, bubbles: true, cancelable: true
+                }));
             }
-
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new KeyboardEvent('keyup', {
-                key: ch, code: code, bubbles: true, cancelable: true
-            }));
 
             timer = setTimeout(typeNext, delay);
         }
