@@ -227,6 +227,27 @@ fn blocked_urls_cached() -> Vec<String> {
         .clone()
 }
 
+/// Ad/tracking-only blocklist for "smart" mode.
+/// Blocks ads and analytics but allows images, CSS, fonts.
+const AD_ONLY_URLS: &[&str] = &[
+    "*google-analytics.com*", "*googletagmanager.com*", "*facebook.net*",
+    "*doubleclick.net*", "*adservice.google.com*", "*pagead2.googlesyndication.com*",
+    "*analytics.js*", "*tracking.js*",
+    "*pixel.quantserve.com*", "*pixel.rubiconproject.com*",
+    "*beacon.krxd.net*", "*beacon.taboola.com*",
+    "*hm.baidu.com*", "*cpro.baidu.com*", "*baidustatic.com*",
+    "*beacon.qq.com*", "*cnzz.com*", "*umeng.com*",
+    "*sentry.io*", "*newrelic.com*", "*hotjar.com*", "*clarity.ms*",
+];
+
+fn ad_only_urls_cached() -> Vec<String> {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Vec<String>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| AD_ONLY_URLS.iter().map(|s| s.to_string()).collect())
+        .clone()
+}
+
 pub async fn set_media_blocking_status(page: &Page, media_enabled: bool) -> Result<()> {
     if media_enabled {
         page.execute(SetBlockedURLsParams { urls: vec![] })
@@ -758,6 +779,15 @@ impl BrowserState {
         page.execute(SetBlockedURLsParams { urls: blocked_urls_cached() })
             .await
             .context("Failed to set blocked URLs")?;
+        Ok(())
+    }
+
+    /// Smart blocking: block only ads/tracking, allow images/CSS/fonts.
+    pub async fn enable_smart_blocking(&self) -> Result<()> {
+        let page = lock_with_timeout(&self.page, "page").await?.clone();
+        page.execute(SetBlockedURLsParams { urls: ad_only_urls_cached() })
+            .await
+            .context("Failed to set ad-only blocked URLs")?;
         Ok(())
     }
 

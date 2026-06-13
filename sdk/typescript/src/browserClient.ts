@@ -52,10 +52,8 @@ export interface BrowserClientOptions {
   connect?: string;
   /** Chrome user-data-dir for session reuse. */
   profile?: string;
-  /** Block images/CSS/fonts/ads. Default: true. */
-  blockResources?: boolean;
-  /** Start with media loading enabled. Default: false. */
-  mediaEnabled?: boolean;
+  /** Resource loading strategy: "block" (default), "allow", "smart". */
+  resources?: "block" | "allow" | "smart";
   /** Show browser window. Default: false. */
   show?: boolean;
   /** Default per-command timeout in ms. Default: 60000. */
@@ -80,8 +78,7 @@ export class BrowserClient {
   private readonly executable: string;
   private readonly connect?: string;
   private readonly profile?: string;
-  private readonly blockResources: boolean;
-  private readonly mediaEnabled: boolean;
+  private readonly resources: "block" | "allow" | "smart";
   private readonly show: boolean;
   private readonly commandTimeoutMs: number;
 
@@ -98,8 +95,7 @@ export class BrowserClient {
     this.executable = options?.executable ?? BrowserClient.findExecutable();
     this.connect = options?.connect;
     this.profile = options?.profile;
-    this.blockResources = options?.blockResources ?? true;
-    this.mediaEnabled = options?.mediaEnabled ?? false;
+    this.resources = options?.resources ?? "block";
     this.show = options?.show ?? false;
     this.commandTimeoutMs =
       options?.commandTimeoutMs ?? BrowserClient.DEFAULT_TIMEOUT_MS;
@@ -125,8 +121,7 @@ export class BrowserClient {
 
     if (this.connect) args.push("--connect", this.connect);
     if (this.profile) args.push("--profile", this.profile);
-    if (!this.blockResources) args.push("--block-resources", "false");
-    if (this.mediaEnabled) args.push("--media-enabled");
+    args.push("--resources", this.resources);
     if (this.show) args.push("--show");
 
     this.proc = spawn(this.executable, args, {

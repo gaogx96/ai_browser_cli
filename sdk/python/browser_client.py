@@ -51,8 +51,7 @@ class BrowserClient:
         executable: Optional[str] = None,
         connect: Optional[str] = None,
         profile: Optional[str] = None,
-        block_resources: bool = True,
-        media_enabled: bool = False,
+        resources: str = "block",
         show: bool = False,
         timeout: float = DEFAULT_TIMEOUT,
     ):
@@ -62,16 +61,14 @@ class BrowserClient:
             connect:     Chrome debugging URL (e.g. "http://127.0.0.1:9222").
                          When set, attaches to existing Chrome instead of launching.
             profile:     Chrome user-data-dir for session reuse.
-            block_resources: Block images/CSS/fonts/ads for speed.
-            media_enabled:   Start with media loading enabled.
+            resources:   Resource loading strategy: "block" (default), "allow", "smart".
             show:        Show browser window (disable headless).
             timeout:     Default per-command timeout in seconds.
         """
         self._executable = executable or self._find_executable()
         self._connect = connect
         self._profile = profile
-        self._block_resources = block_resources
-        self._media_enabled = media_enabled
+        self._resources = resources
         self._show = show
         self._timeout = timeout
 
@@ -93,10 +90,7 @@ class BrowserClient:
             cmd.extend(["--connect", self._connect])
         if self._profile:
             cmd.extend(["--profile", self._profile])
-        if not self._block_resources:
-            cmd.extend(["--block-resources", "false"])
-        if self._media_enabled:
-            cmd.append("--media-enabled")
+        cmd.extend(["--resources", self._resources])
         if self._show:
             cmd.append("--show")
 

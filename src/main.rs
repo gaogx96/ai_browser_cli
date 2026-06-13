@@ -16,7 +16,7 @@ use utils::write_json_stdout;
 /// AI Agent Browser CLI - High-performance headless browser control via CDP.
 #[derive(Parser)]
 #[command(name = "agent-browser-cli")]
-#[command(version = "0.5.0")]
+#[command(version = "0.6.0")]
 #[command(about = "AI Agent headless browser CLI", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -57,13 +57,12 @@ enum Commands {
         #[arg(long)]
         connect: Option<String>,
 
-        /// Enable aggressive resource blocking (images, CSS, fonts, ads)
-        #[arg(short, long, default_value = "true")]
-        block_resources: bool,
-
-        /// Start with media loading enabled (skip initial blocking).
-        #[arg(long, default_value = "false")]
-        media_enabled: bool,
+        /// Resource loading strategy:
+        ///   block — block images, CSS, fonts, ads (fastest, default)
+        ///   allow — allow all resources (full rendering)
+        ///   smart — block only ads/tracking, allow images and CSS
+        #[arg(long, default_value = "block")]
+        resources: String,
 
         /// Show browser window (disable headless mode)
         #[arg(long, default_value = "false")]
@@ -93,15 +92,13 @@ async fn main() {
         Commands::Listen {
             profile,
             connect,
-            block_resources,
-            media_enabled,
+            resources,
             show,
         } => {
             cmd_listen(
                 profile.as_deref(),
                 connect.as_deref(),
-                block_resources,
-                media_enabled,
+                &resources,
                 show,
             )
             .await
@@ -235,8 +232,7 @@ async fn cmd_view(
 async fn cmd_listen(
     profile: Option<&str>,
     connect: Option<&str>,
-    block_resources: bool,
-    media_enabled: bool,
+    resources: &str,
     show: bool,
 ) -> i32 {
     let bs = match resolve_browser(profile, connect, show).await {
@@ -251,19 +247,46 @@ async fn cmd_listen(
         }
     };
 
-    if block_resources && !media_enabled {
-        if let Err(e) = bs.enable_resource_blocking().await {
+    // Apply resource loading strategy
+    let mut media_on = match resources {
+        "block" => {
+            // Block images, CSS, fonts, ads — fastest page loads
+            if let Err(e) = bs.enable_resource_blocking().await {
+                let _ = write_json_stdout(&json!({
+                    "status": "error",
+                    "error": format!("{:#}", e)
+                })).await;
+                shutdown_browser(bs, "listen").await;
+                return 1;
+            }
+            false
+        }
+        "allow" => {
+            // Allow all resources — full rendering
+            true
+        }
+        "smart" => {
+            // Block ads/tracking only, allow images/CSS/fonts
+            // Uses CDP Network.setBlockedURLs with ad-only patterns
+            if let Err(e) = bs.enable_smart_blocking().await {
+                let _ = write_json_stdout(&json!({
+                    "status": "error",
+                    "error": format!("{:#}", e)
+                })).await;
+                shutdown_browser(bs, "listen").await;
+                return 1;
+            }
+            false
+        }
+        _ => {
             let _ = write_json_stdout(&json!({
                 "status": "error",
-                "error": format!("{:#}", e)
-            }))
-            .await;
+                "error": format!("Unknown resources strategy: '{}'. Use block/allow/smart", resources)
+            })).await;
             shutdown_browser(bs, "listen").await;
             return 1;
         }
-    }
-
-    let mut media_on = media_enabled;
+    };
 
     let ready = json!({
         "status": "ready",
