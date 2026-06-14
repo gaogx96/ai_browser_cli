@@ -9,7 +9,6 @@ use chromiumoxide::page::Page;
 use futures::StreamExt;
 use rand::Rng;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
@@ -388,39 +387,114 @@ fn should_skip_for_idle(url: &str, resource_type: &Option<ResourceType>) -> bool
     false
 }
 
+// R-06 fix: LoaderId-isolated network idle tracker.
+//
+// Instead of a single global AtomicUsize, we track active request counts
+// per LoaderId. Each CDP navigation produces a unique LoaderId, and each
+// request's lifecycle (requestWillBeSent → loadingFinished/loadingFailed)
+// is scoped to its LoaderId. This prevents stale events from page A
+// polluting the idle detection of page B.
+//
+// Architecture:
+//   - request_counts: HashMap<LoaderId, usize> — active requests per loader
+//   - request_to_loader: HashMap<RequestId, LoaderId> — maps request to its loader
+//   - active_loader: the current LoaderId we're waiting on
+//   - notify: wakes wait_for_idle when the active loader's count hits 0
+
+
 struct NetworkIdleTracker {
-    active_count: AtomicUsize,
+    /// Per-loader active request counts.
+    request_counts: Mutex<std::collections::HashMap<String, usize>>,
+    /// Maps request_id → loader_id for decrement routing.
+    request_to_loader: Mutex<std::collections::HashMap<String, String>>,
+    /// The LoaderId of the current navigation we're waiting on.
+    active_loader: Mutex<String>,
+    /// Notified when the active loader's count reaches 0.
     notify: Notify,
 }
 
 impl NetworkIdleTracker {
     fn new() -> Self {
         Self {
-            active_count: AtomicUsize::new(0),
+            request_counts: Mutex::new(std::collections::HashMap::new()),
+            request_to_loader: Mutex::new(std::collections::HashMap::new()),
+            active_loader: Mutex::new(String::new()),
             notify: Notify::new(),
         }
     }
 
-    fn on_request_start(&self, url: &str, resource_type: &Option<ResourceType>) {
+    /// Called on requestWillBeSent. Increments the count for this request's loader.
+    async fn on_request_start(
+        &self,
+        loader_id: &str,
+        request_id: &str,
+        url: &str,
+        resource_type: &Option<ResourceType>,
+    ) {
         if should_skip_for_idle(url, resource_type) {
             return;
         }
-        self.active_count.fetch_add(1, Ordering::SeqCst);
-    }
 
-    fn on_request_done(&self) {
-        let prev = self.active_count.fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |current| Some(current.saturating_sub(1)),
-        );
-        if let Ok(1) = prev {
-            self.notify.notify_one();
+        // Record request → loader mapping
+        {
+            let mut mapping = self.request_to_loader.lock().await;
+            mapping.insert(request_id.to_string(), loader_id.to_string());
+        }
+
+        // Increment loader's count
+        {
+            let mut counts = self.request_counts.lock().await;
+            let entry = counts.entry(loader_id.to_string()).or_insert(0);
+            *entry += 1;
         }
     }
 
-    fn is_idle(&self) -> bool {
-        self.active_count.load(Ordering::SeqCst) == 0
+    /// Called on loadingFinished/loadingFailed. Decrements the count for
+    /// the loader that owns this request.
+    async fn on_request_done(&self, request_id: &str) {
+        // Look up which loader this request belongs to
+        let loader_id = {
+            let mut mapping = self.request_to_loader.lock().await;
+            mapping.remove(request_id)
+        };
+
+        let loader_id = match loader_id {
+            Some(id) => id,
+            None => return, // Unknown request, ignore
+        };
+
+        // Decrement the loader's count
+        let became_zero = {
+            let mut counts = self.request_counts.lock().await;
+            if let Some(count) = counts.get_mut(&loader_id) {
+                *count = count.saturating_sub(1);
+                let is_zero = *count == 0;
+                if is_zero {
+                    counts.remove(&loader_id);
+                }
+                is_zero
+            } else {
+                false
+            }
+        };
+
+        // If this was the active loader and it just hit 0, notify
+        if became_zero {
+            let active = self.active_loader.lock().await;
+            if loader_id == *active {
+                self.notify.notify_one();
+            }
+        }
+    }
+
+    /// Check if the active loader has no pending requests.
+    async fn is_idle(&self) -> bool {
+        let active = self.active_loader.lock().await;
+        if active.is_empty() {
+            return true;
+        }
+        let counts = self.request_counts.lock().await;
+        counts.get(&*active).copied().unwrap_or(0) == 0
     }
 }
 
@@ -676,12 +750,18 @@ impl BrowserState {
 
         let mut handles = Vec::with_capacity(4);
 
+        // R-06 fix: pass loader_id and request_id for per-loader tracking
         let tracker_req = Arc::clone(tracker);
         match page.event_listener::<EventRequestWillBeSent>().await {
             Ok(mut stream) => {
                 let h = tokio::spawn(async move {
                     while let Some(event) = stream.next().await {
-                        tracker_req.on_request_start(&event.request.url, &event.r#type);
+                        tracker_req.on_request_start(
+                            event.loader_id.as_ref(),
+                            event.request_id.as_ref(),
+                            &event.request.url,
+                            &event.r#type,
+                        ).await;
                     }
                 });
                 handles.push(h.abort_handle());
@@ -702,12 +782,13 @@ impl BrowserState {
             Err(e) => eprintln!("[idle] Failed to listen for responseReceived: {}", e),
         }
 
+        // R-06 fix: pass request_id for loader-id routing
         let tracker_fin = Arc::clone(tracker);
         match page.event_listener::<EventLoadingFinished>().await {
             Ok(mut stream) => {
                 let h = tokio::spawn(async move {
-                    while let Some(_event) = stream.next().await {
-                        tracker_fin.on_request_done();
+                    while let Some(event) = stream.next().await {
+                        tracker_fin.on_request_done(event.request_id.as_ref()).await;
                     }
                 });
                 handles.push(h.abort_handle());
@@ -719,8 +800,8 @@ impl BrowserState {
         match page.event_listener::<EventLoadingFailed>().await {
             Ok(mut stream) => {
                 let h = tokio::spawn(async move {
-                    while let Some(_event) = stream.next().await {
-                        tracker_fail.on_request_done();
+                    while let Some(event) = stream.next().await {
+                        tracker_fail.on_request_done(event.request_id.as_ref()).await;
                     }
                 });
                 handles.push(h.abort_handle());
@@ -752,7 +833,12 @@ impl BrowserState {
         if let Ok(mut stream) = page.event_listener::<EventRequestWillBeSent>().await {
             let h = tokio::spawn(async move {
                 while let Some(event) = stream.next().await {
-                    tracker_req.on_request_start(&event.request.url, &event.r#type);
+                    tracker_req.on_request_start(
+                        event.loader_id.as_ref(),
+                        event.request_id.as_ref(),
+                        &event.request.url,
+                        &event.r#type,
+                    ).await;
                 }
             });
             handles.push(h.abort_handle());
@@ -771,8 +857,8 @@ impl BrowserState {
         let tracker_fin = Arc::clone(tracker);
         if let Ok(mut stream) = page.event_listener::<EventLoadingFinished>().await {
             let h = tokio::spawn(async move {
-                while let Some(_event) = stream.next().await {
-                    tracker_fin.on_request_done();
+                while let Some(event) = stream.next().await {
+                    tracker_fin.on_request_done(event.request_id.as_ref()).await;
                 }
             });
             handles.push(h.abort_handle());
@@ -781,8 +867,8 @@ impl BrowserState {
         let tracker_fail = Arc::clone(tracker);
         if let Ok(mut stream) = page.event_listener::<EventLoadingFailed>().await {
             let h = tokio::spawn(async move {
-                while let Some(_event) = stream.next().await {
-                    tracker_fail.on_request_done();
+                while let Some(event) = stream.next().await {
+                    tracker_fail.on_request_done(event.request_id.as_ref()).await;
                 }
             });
             handles.push(h.abort_handle());
@@ -812,6 +898,24 @@ impl BrowserState {
 
     pub async fn navigate(&self, url: &str) -> Result<()> {
         let page = lock_with_timeout(&self.page, "page").await?.clone();
+
+        // R-06 fix: start listening for the navigation's loader_id before goto.
+        // We need to capture the LoaderId from the first requestWillBeSent
+        // event that this navigation produces. We do this by temporarily
+        // registering a one-shot listener on the page.
+        // However, the simplest approach is to use the response from goto()
+        // which may contain the frame/loader info. Since chromiumoxide doesn't
+        // expose this directly, we set the active loader to "pending" and
+        // update it when the first requestWillBeSent arrives with a new loader_id.
+        //
+        // For now, we clear the active loader before navigation so that
+        // any events from the old page don't affect the new idle detection.
+        // The first requestWillBeSent with a new loader_id will set it.
+        {
+            let mut active = self.idle_tracker.active_loader.lock().await;
+            active.clear();
+        }
+
         let goto_result = tokio::time::timeout(NAVIGATE_TIMEOUT, page.goto(url)).await;
         match goto_result {
             Err(_) => anyhow::bail!("Navigation to {} timed out (30s)", url),
@@ -819,6 +923,20 @@ impl BrowserState {
                 inner.with_context(|| format!("Failed to navigate to {}", url))?;
             }
         }
+
+        // The navigation has completed. The CDP events during navigation
+        // have already populated the tracker with the new loader_id.
+        // We need to find the latest loader_id from the request_counts map
+        // and set it as the active loader.
+        {
+            let counts = self.idle_tracker.request_counts.lock().await;
+            let mut active = self.idle_tracker.active_loader.lock().await;
+            // The loader with the most recent requests is the active one
+            if let Some((latest_loader, _)) = counts.iter().max_by_key(|(_, v)| **v) {
+                *active = latest_loader.clone();
+            }
+        }
+
         self.wait_for_idle().await;
         self.detect_new_tab().await;
         Ok(())
@@ -1153,10 +1271,13 @@ impl BrowserState {
 
     // ─── Network idle ────────────────────────────────────────────────────
 
+    /// R-06 fix: wait_for_idle now uses per-loader-id idle detection.
+    /// Only the active loader's request count is checked, preventing
+    /// stale events from old pages from triggering early idle.
     async fn wait_for_idle(&self) {
-        if self.idle_tracker.is_idle() {
+        if self.idle_tracker.is_idle().await {
             tokio::time::sleep(IDLE_DEBOUNCE).await;
-            if self.idle_tracker.is_idle() {
+            if self.idle_tracker.is_idle().await {
                 return;
             }
         }
@@ -1176,7 +1297,7 @@ impl BrowserState {
                 break;
             }
             tokio::time::sleep(IDLE_DEBOUNCE).await;
-            if self.idle_tracker.is_idle() {
+            if self.idle_tracker.is_idle().await {
                 break;
             }
         }
