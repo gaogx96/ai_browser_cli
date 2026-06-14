@@ -434,6 +434,9 @@ pub struct BrowserState {
     known_pages: Arc<Mutex<HashSet<String>>>,
     idle_tracker: Arc<NetworkIdleTracker>,
     _shutdown_tx: mpsc::Sender<()>,
+    /// R-01 fix: abort handles for network listener tasks.
+    /// When switching tabs, old listeners are aborted before spawning new ones.
+    listener_handles: Mutex<Vec<tokio::task::AbortHandle>>,
     /// True if we connected to an existing Chrome (via --connect).
     /// In this mode, close() must NOT send Browser.close — that would
     /// kill the user's Chrome. We just disconnect instead.
@@ -514,7 +517,7 @@ impl BrowserState {
     /// Initialize network listeners, auto-attach, and page state on a browser.
     async fn init_page_state(
         browser: &Browser,
-    ) -> Result<(Arc<Mutex<Page>>, Arc<Mutex<HashSet<String>>>, Arc<NetworkIdleTracker>)> {
+    ) -> Result<(Arc<Mutex<Page>>, Arc<Mutex<HashSet<String>>>, Arc<NetworkIdleTracker>, Vec<tokio::task::AbortHandle>)> {
         let initial_pages = cdp_op_with_timeout(browser.pages(), "pages")
             .await
             .unwrap_or_default();
@@ -549,9 +552,9 @@ impl BrowserState {
         }
 
         let idle_tracker = Arc::new(NetworkIdleTracker::new());
-        Self::spawn_network_listeners(&current_page, &idle_tracker).await;
+        let handles = Self::spawn_network_listeners(&current_page, &idle_tracker).await;
 
-        Ok((current_page, known_pages, idle_tracker))
+        Ok((current_page, known_pages, idle_tracker, handles))
     }
 
     /// Launch a new Chrome instance.
@@ -608,7 +611,7 @@ impl BrowserState {
         let (_shutdown_tx, ready_rx) = Self::spawn_handler(handler);
         Self::wait_for_handler(ready_rx, false).await?;
 
-        let (current_page, known_pages, idle_tracker) = Self::init_page_state(&browser).await?;
+        let (current_page, known_pages, idle_tracker, listener_handles) = Self::init_page_state(&browser).await?;
 
         Ok(Self {
             browser,
@@ -616,6 +619,7 @@ impl BrowserState {
             known_pages,
             idle_tracker,
             _shutdown_tx,
+            listener_handles: Mutex::new(listener_handles),
             connected: false,
         })
     }
@@ -640,7 +644,7 @@ impl BrowserState {
         let (_shutdown_tx, ready_rx) = Self::spawn_handler(handler);
         Self::wait_for_handler(ready_rx, true).await?;
 
-        let (current_page, known_pages, idle_tracker) = Self::init_page_state(&browser).await?;
+        let (current_page, known_pages, idle_tracker, listener_handles) = Self::init_page_state(&browser).await?;
 
         eprintln!("[connect] Successfully attached to existing Chrome at {}", url);
         Ok(Self {
@@ -649,6 +653,7 @@ impl BrowserState {
             known_pages,
             idle_tracker,
             _shutdown_tx,
+            listener_handles: Mutex::new(listener_handles),
             connected: true,
         })
     }
@@ -656,120 +661,134 @@ impl BrowserState {
     // ─── Network listeners ───────────────────────────────────────────────
 
     /// Spawn CDP Network event listeners on a page.
+    /// Returns abort handles so callers can cancel listeners when switching tabs.
     async fn spawn_network_listeners(
         page: &Arc<Mutex<Page>>,
         tracker: &Arc<NetworkIdleTracker>,
-    ) {
+    ) -> Vec<tokio::task::AbortHandle> {
         let page = match lock_with_timeout(page, "page").await {
             Ok(guard) => guard.clone(),
             Err(e) => {
                 eprintln!("[idle] Cannot acquire page for network listeners: {}", e);
-                return;
+                return vec![];
             }
         };
 
-        // Request start — increment counter (with multi-dimensional filtering)
+        let mut handles = Vec::with_capacity(4);
+
         let tracker_req = Arc::clone(tracker);
         match page.event_listener::<EventRequestWillBeSent>().await {
             Ok(mut stream) => {
-                tokio::spawn(async move {
+                let h = tokio::spawn(async move {
                     while let Some(event) = stream.next().await {
                         tracker_req.on_request_start(&event.request.url, &event.r#type);
                     }
                 });
+                handles.push(h.abort_handle());
             }
             Err(e) => eprintln!("[idle] Failed to listen for requestWillBeSent: {}", e),
         }
 
-        // responseReceived — no counter change (fires on headers, not body complete)
         let tracker_resp = Arc::clone(tracker);
         match page.event_listener::<EventResponseReceived>().await {
             Ok(mut stream) => {
-                tokio::spawn(async move {
+                let h = tokio::spawn(async move {
                     while let Some(_event) = stream.next().await {
                         let _ = &tracker_resp;
                     }
                 });
+                handles.push(h.abort_handle());
             }
             Err(e) => eprintln!("[idle] Failed to listen for responseReceived: {}", e),
         }
 
-        // Loading finished — decrement counter
         let tracker_fin = Arc::clone(tracker);
         match page.event_listener::<EventLoadingFinished>().await {
             Ok(mut stream) => {
-                tokio::spawn(async move {
+                let h = tokio::spawn(async move {
                     while let Some(_event) = stream.next().await {
                         tracker_fin.on_request_done();
                     }
                 });
+                handles.push(h.abort_handle());
             }
             Err(e) => eprintln!("[idle] Failed to listen for loadingFinished: {}", e),
         }
 
-        // Loading failed — decrement counter
         let tracker_fail = Arc::clone(tracker);
         match page.event_listener::<EventLoadingFailed>().await {
             Ok(mut stream) => {
-                tokio::spawn(async move {
+                let h = tokio::spawn(async move {
                     while let Some(_event) = stream.next().await {
                         tracker_fail.on_request_done();
                     }
                 });
+                handles.push(h.abort_handle());
             }
             Err(e) => eprintln!("[idle] Failed to listen for loadingFailed: {}", e),
         }
+
+        handles
     }
 
     /// Register network event listeners on a new page (e.g. after tab switch).
-    /// Hermes #1 fix: fully async — no futures::executor::block_on.
+    /// R-01 fix: abort old listeners before spawning new ones.
+    /// Returns new abort handles.
     async fn spawn_network_listeners_static(
         page: &Arc<Mutex<Page>>,
         tracker: &Arc<NetworkIdleTracker>,
-    ) {
+    ) -> Vec<tokio::task::AbortHandle> {
         let page = match lock_with_timeout(page, "page").await {
             Ok(guard) => guard.clone(),
             Err(e) => {
                 eprintln!("[idle] Cannot acquire page for network listeners: {}", e);
-                return;
+                return vec![];
             }
         };
 
+        let mut handles = Vec::with_capacity(4);
+
         let tracker_req = Arc::clone(tracker);
         if let Ok(mut stream) = page.event_listener::<EventRequestWillBeSent>().await {
-            tokio::spawn(async move {
+            let h = tokio::spawn(async move {
                 while let Some(event) = stream.next().await {
                     tracker_req.on_request_start(&event.request.url, &event.r#type);
                 }
             });
+            handles.push(h.abort_handle());
         }
 
         let tracker_resp = Arc::clone(tracker);
         if let Ok(mut stream) = page.event_listener::<EventResponseReceived>().await {
-            tokio::spawn(async move {
+            let h = tokio::spawn(async move {
                 while let Some(_event) = stream.next().await {
                     let _ = &tracker_resp;
                 }
             });
+            handles.push(h.abort_handle());
         }
 
         let tracker_fin = Arc::clone(tracker);
         if let Ok(mut stream) = page.event_listener::<EventLoadingFinished>().await {
-            tokio::spawn(async move {
+            let h = tokio::spawn(async move {
                 while let Some(_event) = stream.next().await {
                     tracker_fin.on_request_done();
                 }
             });
+            handles.push(h.abort_handle());
         }
 
         let tracker_fail = Arc::clone(tracker);
         if let Ok(mut stream) = page.event_listener::<EventLoadingFailed>().await {
-            tokio::spawn(async move {
+            let h = tokio::spawn(async move {
                 while let Some(_event) = stream.next().await {
                     tracker_fail.on_request_done();
                 }
             });
+            handles.push(h.abort_handle());
         }
+
+        handles
     }
 
     // ─── Public API ──────────────────────────────────────────────────────
@@ -1203,8 +1222,14 @@ impl BrowserState {
                 if let Ok(mut active) = lock_with_timeout(&self.page, "page").await {
                     *active = new_page.clone();
                 }
-                // Hermes #1 fix: async call, no block_on
-                Self::spawn_network_listeners_static(&self.page, &self.idle_tracker).await;
+                // R-01 fix: abort old listeners before spawning new ones
+                if let Ok(mut handles) = lock_with_timeout(&self.listener_handles, "listener_handles").await {
+                    for h in handles.drain(..) {
+                        h.abort();
+                    }
+                    let new_handles = Self::spawn_network_listeners_static(&self.page, &self.idle_tracker).await;
+                    *handles = new_handles;
+                }
             }
         }
     }
@@ -1236,8 +1261,14 @@ impl BrowserState {
                 if let Ok(mut active) = lock_with_timeout(&self.page, "page").await {
                     *active = new_page.clone();
                 }
-                // Hermes #1 fix: async call, no block_on
-                Self::spawn_network_listeners_static(&self.page, &self.idle_tracker).await;
+                // R-01 fix: abort old listeners before spawning new ones
+                if let Ok(mut handles) = lock_with_timeout(&self.listener_handles, "listener_handles").await {
+                    for h in handles.drain(..) {
+                        h.abort();
+                    }
+                    let new_handles = Self::spawn_network_listeners_static(&self.page, &self.idle_tracker).await;
+                    *handles = new_handles;
+                }
             }
         }
 

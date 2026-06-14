@@ -166,7 +166,7 @@ pub fn smart_scroll_script(agent_id_escaped: &str) -> String {
     }}
 
     return {{
-        scrolled: scrolledFrames > 0 || true,
+        scrolled: scrolledFrames > 0,
         inView: false,
         crossFrame: scrolledFrames > 0,
         crossOriginFallback: crossOriginFallback
