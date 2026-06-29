@@ -13,6 +13,7 @@ AI Agent 专属浏览器 CLI — 通过 CDP 协议操控真实 Chrome，为 LLM 
 - **拟人化输入** — CJK 用 `InputEvent`，ASCII 用 `KeyboardEvent`，逐键随机延迟
 - **Windows Job Object** — 进程异常退出时 Chrome 自动被内核级机制终止
 - **内置 Agent Prompt** — `prompt` 子命令直接输出 LLM 系统提示词
+- **MCP 标准协议** — `mcp` 子命令实现 MCP JSON-RPC 2.0，可直接被 Claude Code / Cursor 等 MCP host 接入
 
 ## 快速开始
 
@@ -31,6 +32,9 @@ cargo build --release
 
 # 方式 3: 管道监听模式（SDK 集成用）
 .\target\release\agent-browser-cli.exe listen --connect http://127.0.0.1:9222
+
+# 方式 4: MCP 标准协议模式（Claude Code 等 MCP host 接入）
+.\target\release\agent-browser-cli.exe mcp --connect http://127.0.0.1:9222
 ```
 
 ## 子命令
@@ -41,7 +45,7 @@ cargo build --release
 agent-browser-cli view --url <URL> [--connect <URL>] [--profile <PATH>] [--show]
 ```
 
-### `listen` — 管道监听模式
+### `listen` — 管道监听模式（自定义 JSON 协议）
 
 ```powershell
 agent-browser-cli listen [--connect <URL>] [--profile <PATH>] [--resources block|allow|smart] [--show]
@@ -51,6 +55,29 @@ agent-browser-cli listen [--connect <URL>] [--profile <PATH>] [--resources block
 - `block` — 阻断图片/CSS/字体/广告（最快，默认）
 - `allow` — 允许所有资源（完整渲染）
 - `smart` — 只阻断广告/追踪，允许图片和 CSS
+
+### `mcp` — MCP 标准协议模式
+
+```powershell
+agent-browser-cli mcp [--connect <URL>] [--profile <PATH>] [--show]
+```
+
+以标准 MCP（Model Context Protocol）JSON-RPC 2.0 协议对外暴露浏览器自动化工具，**兼容任何 MCP host**（Claude Code、Cursor 等）。
+
+**支持的 MCP 工具：**
+
+| 工具名 | 参数 | 返回值 |
+|--------|------|--------|
+| `navigate` | `url` (必填) | 页面标题 + 交互元素树 |
+| `click` | `target_id` (必填) | 更新后的元素树 |
+| `type` | `target_id`, `text` (必填) | 更新后的元素树 |
+| `screenshot` | — | PNG 截图文件路径 |
+| `tree` | — | 当前页面交互元素树 |
+| `meta` | — | 页面标题 / URL / 元素数 |
+| `get_prompt` | — | 内置 Agent 系统提示词 |
+| `configure` | `media_enabled` (必填) | 运行时切换资源加载策略 |
+
+所有工具返回 `text` 类型的 Content Block，遵循 MCP 标准。
 
 ### `prompt` — 输出 Agent 系统提示词
 
