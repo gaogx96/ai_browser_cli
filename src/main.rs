@@ -1,5 +1,6 @@
 mod browser;
 mod injector;
+mod mcp;
 mod prompt;
 mod utils;
 
@@ -69,6 +70,24 @@ enum Commands {
         show: bool,
     },
 
+    /// MCP (Model Context Protocol) mode: expose browser actions as MCP tools
+    /// over stdin/stdout JSON-RPC 2.0 newline-delimited protocol.
+    /// Compatible with any MCP host (Claude Code, Cursor, etc.).
+    Mcp {
+        /// Chrome profile path for session reuse
+        #[arg(short, long)]
+        profile: Option<String>,
+
+        /// Connect to an existing Chrome instance via debugging port.
+        /// E.g., --connect http://127.0.0.1:9222
+        #[arg(long)]
+        connect: Option<String>,
+
+        /// Show browser window (disable headless mode)
+        #[arg(long, default_value = "false")]
+        show: bool,
+    },
+
     /// Print the AI Agent system prompt to stdout and exit.
     /// Use this to feed the prompt into your LLM pipeline.
     Prompt,
@@ -103,12 +122,19 @@ async fn main() {
             )
             .await
         }
+        Commands::Mcp {
+            profile,
+            connect,
+            show,
+        } => {
+            mcp::cmd_mcp(profile.as_deref(), connect.as_deref(), show).await
+        }
     };
 
     std::process::exit(exit_code);
 }
 
-async fn shutdown_browser(mut bs: BrowserState, context: &str) {
+pub(crate) async fn shutdown_browser(mut bs: BrowserState, context: &str) {
     match tokio::time::timeout(SHUTDOWN_TIMEOUT, bs.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
@@ -131,7 +157,7 @@ async fn shutdown_browser(mut bs: BrowserState, context: &str) {
 ///   2. Otherwise, probe 127.0.0.1:9222 with a 50ms TCP handshake.
 ///      - If Chrome responds → auto-attach in connect mode (preserves sessions).
 ///      - If no response → fall back to launch mode with anti-detection flags.
-async fn resolve_browser(
+pub(crate) async fn resolve_browser(
     profile: Option<&str>,
     connect: Option<&str>,
     show: bool,
