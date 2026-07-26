@@ -1,0 +1,2 @@
+# MCP Server dependencies for agent-browser-cli
+mcp>=1.0.0

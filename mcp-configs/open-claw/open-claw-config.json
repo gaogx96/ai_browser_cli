@@ -1,0 +1,19 @@
+{
+  "mcpServers": [
+    {
+      "name": "agent-browser",
+      "description": "Browser automation CLI — accessibility tree extraction, click, type, screenshot via CDP",
+      "command": "python",
+      "args": ["D:/agent_browser_cli/ai_browser_cli_repo/mcp_server.py"],
+      "tools": [
+        "navigate",
+        "click",
+        "type_text",
+        "screenshot",
+        "page_tree",
+        "page_meta",
+        "get_prompt"
+      ]
+    }
+  ]
+}

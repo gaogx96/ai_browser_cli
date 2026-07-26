@@ -1,0 +1,10 @@
+# Hermes MCP Server: agent-browser-cli
+# https://github.com/arcprize/hermes
+#
+# 放置位置: ~/.config/hermes/config.yaml 或项目目录 hermes-config.yaml
+mcp_servers:
+  agent-browser:
+    command: python
+    args:
+      - D:/agent_browser_cli/ai_browser_cli_repo/mcp_server.py
+    description: "Browser automation via Chrome CDP — navigate, click, type, screenshot"

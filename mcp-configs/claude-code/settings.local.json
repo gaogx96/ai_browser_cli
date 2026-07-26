@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "agent-browser": {
+      "command": "python",
+      "args": [
+        "D:/agent_browser_cli/ai_browser_cli_repo/mcp_server.py"
+      ]
+    }
+  }
+}
