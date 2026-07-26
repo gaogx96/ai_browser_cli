@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
+*.exe
 
 # Debug dumps
 /debug_dumps/
@@ -24,3 +25,9 @@ __pycache__/
 # Node.js
 node_modules/
 dist/
+
+# Claude
+.claude/
+
+# PowerShell test artifacts
+*.tmp

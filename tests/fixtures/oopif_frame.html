@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>OOPIF Test Frame</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background: #e8f4e8; }
+  h2 { color: #006600; }
+  .frame-content { background: white; padding: 15px; border-radius: 8px; }
+  .marker { display: none; }
+  button { margin: 5px; padding: 8px 16px; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; }
+</style>
+</head>
+<body>
+  <h2>Cross-Origin Iframe</h2>
+  <div class="frame-content">
+    <p>This content is from a different origin (port 8081).</p>
+    <p class="marker">IFRAME_MARKER</p>
+    <p>It should be rendered as an OOPIF (out-of-process iframe).</p>
+    <button id="iframe-btn-1" onclick="this.textContent='CLICKED-ORIGINAL'">Iframe Button 1</button>
+    <button id="iframe-btn-2">Iframe Button 2</button>
+  </div>
+</body>
+</html>

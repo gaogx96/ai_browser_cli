@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Agent Browser Bridge",
+  "version": "0.1.0",
+  "description": "Bridge between agent-browser-cli and Chrome via chrome.debugger API",
+  "minimum_chrome_version": "120",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "alarms",
+    "downloads"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "sw.js",
+    "type": "module"
+  }
+}

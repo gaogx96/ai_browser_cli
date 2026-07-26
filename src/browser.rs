@@ -1,20 +1,30 @@
 use anyhow::{Context, Result};
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::browser::{
+    SetDownloadBehaviorBehavior, SetDownloadBehaviorParams,
+};
 use chromiumoxide::cdp::browser_protocol::network::{
     EnableParams, EventLoadingFailed, EventLoadingFinished, EventRequestWillBeSent,
     EventResponseReceived, SetBlockedUrLsParams as SetBlockedURLsParams,
 };
+use chromiumoxide::cdp::browser_protocol::page::{
+    CreateIsolatedWorldParams, FrameId, FrameTree, GetFrameTreeParams,
+};
 use chromiumoxide::cdp::browser_protocol::target::SetAutoAttachParams;
+use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::page::Page;
+use chromiumoxide::cdp::js_protocol::runtime::ExecutionContextId;
 use futures::StreamExt;
 use rand::Rng;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 
 use crate::injector::{
-    EXTRACT_TREE_SCRIPT, HUMAN_TYPE_SCRIPT, PAGE_META_SCRIPT, smart_scroll_script,
+    ANTI_FINGERPRINT_SCRIPT, ASSERT_ELEMENT_SCRIPT, EXTRACT_CONTENT_SCRIPT,
+    EXTRACT_TREE_SCRIPT, HUMAN_TYPE_SCRIPT, PAGE_META_SCRIPT, WAIT_FOR_ELEMENT_SCRIPT,
+    smart_scroll_script,
 };
 use crate::utils::{escape_js_string, save_screenshot};
 
@@ -27,7 +37,7 @@ const NAVIGATE_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(12);
 const HANDLER_READY_TIMEOUT: Duration = Duration::from_secs(5);
-const CDP_OP_TIMEOUT: Duration = Duration::from_secs(10);
+const CDP_OP_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_DEBOUNCE: Duration = Duration::from_millis(200);
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -44,14 +54,30 @@ fn validate_target_id(id: &str) -> Result<()> {
     if id.is_empty() {
         anyhow::bail!("target_id must not be empty");
     }
+    // Accept both legacy format "e5" and frame-prefixed format "f0-e5"
     let bytes = id.as_bytes();
-    if bytes[0] != b'e' || !bytes[1..].iter().all(|b| b.is_ascii_digit()) {
-        anyhow::bail!(
-            "target_id has invalid format: '{}'. Expected 'e' followed by digits (e.g., 'e5')",
-            id
-        );
+    if bytes[0] == b'e' && bytes[1..].iter().all(|b| b.is_ascii_digit()) {
+        return Ok(()); // legacy format
     }
-    Ok(())
+    // Frame-prefixed format: f{idx}-e{local_id}
+    if bytes[0] == b'f' {
+        let dash_pos = id.find('-');
+        if let Some(pos) = dash_pos {
+            let idx_part = &id[1..pos];
+            let local_part = &id[pos+1..];
+            if idx_part.bytes().all(|b| b.is_ascii_digit())
+                && local_part.len() > 1
+                && local_part.as_bytes()[0] == b'e'
+                && local_part[1..].bytes().all(|b| b.is_ascii_digit())
+            {
+                return Ok(());
+            }
+        }
+    }
+    anyhow::bail!(
+        "target_id has invalid format: '{}'. Expected 'e5' or 'f0-e5'",
+        id
+    );
 }
 
 fn validate_text(text: &str) -> Result<()> {
@@ -506,6 +532,9 @@ pub struct BrowserState {
     pub browser: Browser,
     pub page: Arc<Mutex<Page>>,
     known_pages: Arc<Mutex<HashSet<String>>>,
+    /// Frame index → FrameId mapping (snapshot from last extract_tree).
+    /// Used by click/type to find the correct frame for a f{idx}-e{local} ID.
+    frame_map: Arc<Mutex<HashMap<usize, FrameId>>>,
     idle_tracker: Arc<NetworkIdleTracker>,
     _shutdown_tx: mpsc::Sender<()>,
     /// R-01 fix: abort handles for network listener tasks.
@@ -623,6 +652,14 @@ impl BrowserState {
             p.execute(auto_attach)
                 .await
                 .context("Failed to enable Target.setAutoAttach")?;
+
+            // Anti-fingerprint: inject before any page JS executes
+            // This script runs on every new document (including iframes and new tabs)
+            // to hide automation traces like Canvas/WebGL fingerprints, empty plugins, etc.
+            if let Err(e) = p.evaluate_on_new_document(ANTI_FINGERPRINT_SCRIPT).await {
+                // Non-fatal: the script may fail on some pages but the browser still works
+                eprintln!("[anti-fingerprint] Script injection failed (non-fatal): {}", e);
+            }
         }
 
         let idle_tracker = Arc::new(NetworkIdleTracker::new());
@@ -694,6 +731,7 @@ impl BrowserState {
             idle_tracker,
             _shutdown_tx,
             listener_handles: Mutex::new(listener_handles),
+            frame_map: Arc::new(Mutex::new(HashMap::new())),
             connected: false,
         })
     }
@@ -728,6 +766,7 @@ impl BrowserState {
             idle_tracker,
             _shutdown_tx,
             listener_handles: Mutex::new(listener_handles),
+            frame_map: Arc::new(Mutex::new(HashMap::new())),
             connected: true,
         })
     }
@@ -943,6 +982,184 @@ impl BrowserState {
     }
 
     pub async fn extract_tree(&self) -> Result<String> {
+        let page = lock_with_timeout(&self.page, "page").await?.clone();
+
+        // Phase 0: scripts do NOT recurse into iframes (no contentDocument traversal).
+        // Strategy 乙: for every frame in the frame tree, create an isolated world,
+        // run mark + extract scripts, merge by tree order.
+
+        // Step 1: Get the full frame tree
+        let frame_tree = match cdp_op_with_timeout(
+            page.execute(GetFrameTreeParams {}),
+            "get_frame_tree",
+        )
+        .await
+        {
+            Ok(resp) => resp.result.frame_tree,
+            Err(e) => {
+                eprintln!("[tree] GetFrameTree failed (falling back to pages()): {}", e);
+                return self.extract_tree_pages().await;
+            }
+        };
+
+        // Step 2: Collect all frames in tree order
+        let mut frames: Vec<FrameInfo> = Vec::new();
+        collect_frames(&frame_tree, &mut frames, 0);
+
+        if frames.is_empty() {
+            eprintln!("[tree] Frame tree is empty");
+            return self.extract_tree_pages().await;
+        }
+
+        // Store the frame index → frameId mapping for click/type to use.
+        // This prevents index drift if the frame tree changes between extract and click.
+        {
+            let mut map = self.frame_map.lock().await;
+            map.clear();
+            for (i, frame) in frames.iter().enumerate() {
+                map.insert(i, frame.frame_id.clone());
+            }
+        }
+
+        // Step 3: For each frame, create isolated world and run mark + extract.
+        // Each frame's elements get a unique prefix so data-agent-id is globally unique.
+        // Format: f{frame_idx}-e{local_id}  (e.g., "f0-e1", "f1-e5")
+        let mut all_lines: Vec<String> = Vec::new();
+
+        const MARK_TEMPLATE: &str = r#"
+        (function(prefix) {
+            document.querySelectorAll('[data-agent-id]').forEach(el => {
+                el.removeAttribute('data-agent-id');
+            });
+            const SELECTORS = [
+                'button', 'a[href]', 'input', 'textarea', 'select',
+                '[role="button"]', '[role="link"]', '[role="checkbox"]',
+                '[role="radio"]', '[role="tab"]', '[role="menuitem"]',
+                '[role="option"]', '[role="switch"]', '[role="slider"]',
+                '[onclick]', '[tabindex]:not([tabindex="-1"])',
+                'details', 'summary', 'label[for]'
+            ];
+            const candidates = new Set();
+            for (const sel of SELECTORS) {
+                for (const el of document.querySelectorAll(sel)) {
+                    candidates.add(el);
+                }
+            }
+            let counter = 0;
+            for (const el of candidates) {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                if (rect.width === 0 && rect.height === 0) continue;
+                if (style.display === 'none') continue;
+                if (style.visibility === 'hidden') continue;
+                if (parseFloat(style.opacity) === 0) continue;
+                if (el.tagName !== 'BODY' && el.offsetParent === null) {
+                    if (style.position !== 'fixed') continue;
+                }
+                counter++;
+                el.setAttribute('data-agent-id', prefix + 'e' + counter);
+            }
+            return counter;
+        })("__PREFIX__")
+        "#;
+
+        for (frame_idx, frame) in frames.iter().enumerate() {
+            let prefix = format!("f{}-", frame_idx);
+
+            // Create an isolated world for this frame
+            let create_world = CreateIsolatedWorldParams::builder()
+                .frame_id(frame.frame_id.clone())
+                .world_name("agent_extract")
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build CreateIsolatedWorldParams: {}", e))?;
+
+            let world_result = match cdp_op_with_timeout(
+                page.execute(create_world),
+                "create_isolated_world",
+            )
+            .await
+            {
+                Ok(resp) => resp.result,
+                Err(e) => {
+                    eprintln!("[tree] createIsolatedWorld failed for frame {}: {}", frame_idx, e);
+                    continue;
+                }
+            };
+            let ctx_id: ExecutionContextId = world_result.execution_context_id;
+
+            // Run the mark script
+            let mark_script = MARK_TEMPLATE.replace("__PREFIX__", &prefix);
+            let mark_eval = EvaluateParams::builder()
+                .expression(mark_script)
+                .context_id(ctx_id)
+                .return_by_value(true)
+                .await_promise(true)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build EvaluateParams: {}", e))?;
+
+            let count = match tokio::time::timeout(EVALUATE_TIMEOUT, page.execute(mark_eval)).await {
+                Ok(Ok(resp)) => {
+                    resp.result
+                        .result
+                        .value
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0)
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[tree] Mark evaluate failed on frame {}: {}", frame_idx, e);
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("[tree] Mark evaluate timed out on frame {}", frame_idx);
+                    continue;
+                }
+            };
+
+            if count == 0 {
+                continue;
+            }
+
+            // Run the extract script
+            let extract_eval = EvaluateParams::builder()
+                .expression(EXTRACT_TREE_SCRIPT)
+                .context_id(ctx_id)
+                .return_by_value(true)
+                .await_promise(true)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build EvaluateParams: {}", e))?;
+
+            let tree_result = match tokio::time::timeout(EVALUATE_TIMEOUT, page.execute(extract_eval)).await {
+                Ok(Ok(resp)) => {
+                    resp.result
+                        .result
+                        .value
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_default()
+                }
+                Ok(Err(_)) => continue,
+                Err(_) => continue,
+            };
+
+            if !tree_result.is_empty() {
+                if frames.len() > 1 {
+                    for line in tree_result.lines() {
+                        all_lines.push(format!("[frame-{}] {}", frame_idx, line));
+                    }
+                } else {
+                    all_lines.extend(tree_result.lines().map(|s| s.to_string()));
+                }
+            }
+        }
+
+        if all_lines.is_empty() {
+            return Ok("[No interactive elements found]".to_string());
+        }
+        Ok(all_lines.join("\n"))
+    }
+
+    /// Fallback: extract tree using browser.pages() (same as original implementation).
+    /// Used when getFrameTree is unavailable or as a compatibility fallback.
+    async fn extract_tree_pages(&self) -> Result<String> {
         let all_pages = cdp_op_with_timeout(self.browser.pages(), "pages_for_tree")
             .await
             .unwrap_or_default();
@@ -1033,48 +1250,95 @@ impl BrowserState {
     pub async fn click(&self, target_id: &str) -> Result<(bool, String)> {
         validate_target_id(target_id)?;
         let safe_id = escape_js_string(target_id);
-        let scrolled = self.smart_scroll(&safe_id).await?;
 
         let known_before = lock_with_timeout(&self.known_pages, "known_pages")
             .await?
             .clone();
 
-        let find_script = format!(
-            r#"(() => {{ const id = CSS.escape("{}"); const el = document.querySelector(`[data-agent-id="${{id}}"]`); return !!el; }})()"#,
-            safe_id
-        );
+        let page = lock_with_timeout(&self.page, "page").await?.clone();
+
+        // Decode the frame prefix from the target_id
+        // Format: "f{idx}-e{local_id}" or legacy "e{id}"
+        let (frame_idx_str, local_id) = if target_id.starts_with('f') {
+            if let Some(dash) = target_id.find('-') {
+                let idx = &target_id[1..dash];
+                let local = &target_id[dash+1..];
+                (Some(idx.to_string()), local.to_string())
+            } else {
+                (None, target_id.to_string())
+            }
+        } else {
+            (None, target_id.to_string())
+        };
+
+        // Find the target frameId either from the frame tree or from browser.pages()
+        let (target_frame_id, scrolled) = if let Some(ref fidx) = frame_idx_str {
+            // Frame-prefixed: get the frame tree, find the frame at idx
+            let frame_idx: usize = fidx.parse().unwrap_or(0);
+            let frame_id = self.get_frame_id_at_index(frame_idx).await?;
+            let scrolled = self.scroll_in_frame(&frame_id, &local_id).await?;
+            (Some(frame_id), scrolled)
+        } else {
+            // Legacy format: try to find in browser.pages()
+            let scrolled = self.smart_scroll(&safe_id).await?;
+            (None, scrolled)
+        };
+
+        // Execute the click script
         let click_script = format!(
             r#"(() => {{ const id = CSS.escape("{}"); const el = document.querySelector(`[data-agent-id="${{id}}"]`); if (!el) return false; el.scrollIntoView({{ block: 'center', behavior: 'instant' }}); el.focus(); el.click(); return true; }})()"#,
             safe_id
         );
 
-        let all_pages = cdp_op_with_timeout(self.browser.pages(), "pages_for_click")
-            .await
-            .unwrap_or_default();
-
-        let mut target_page: Option<Page> = None;
-        for page in &all_pages {
-            match tokio::time::timeout(EVALUATE_TIMEOUT, page.evaluate(find_script.as_str())).await {
-                Ok(Ok(result)) => {
-                    if result.value().and_then(|v| v.as_bool()).unwrap_or(false) {
-                        target_page = Some(page.clone());
-                        break;
-                    }
-                }
-                _ => continue,
+        let clicked = if let Some(ref frame_id) = target_frame_id {
+            // Execute in the frame's isolated world
+            let ctx_id = self.create_world_for_frame(frame_id).await?;
+            let eval_params = EvaluateParams::builder()
+                .expression(click_script)
+                .context_id(ctx_id)
+                .return_by_value(true)
+                .await_promise(true)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build EvaluateParams: {}", e))?;
+            match tokio::time::timeout(EVALUATE_TIMEOUT, page.execute(eval_params)).await {
+                Ok(Ok(resp)) => resp.result.result.value.and_then(|v| v.as_bool()).unwrap_or(false),
+                _ => false,
             }
-        }
+        } else {
+            // Legacy: find in browser.pages()
+            let all_pages = cdp_op_with_timeout(self.browser.pages(), "pages_for_click")
+                .await
+                .unwrap_or_default();
 
-        let page = match target_page {
-            Some(p) => p,
-            None => anyhow::bail!("Element [{}] not found in any frame", safe_id),
+            let find_script = format!(
+                r#"(() => {{ const id = CSS.escape("{}"); const el = document.querySelector(`[data-agent-id="${{id}}"]`); return !!el; }})()"#,
+                safe_id
+            );
+
+            let mut target_page: Option<Page> = None;
+            for p in &all_pages {
+                match tokio::time::timeout(EVALUATE_TIMEOUT, p.evaluate(find_script.as_str())).await {
+                    Ok(Ok(result)) => {
+                        if result.value().and_then(|v| v.as_bool()).unwrap_or(false) {
+                            target_page = Some(p.clone());
+                            break;
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+
+            match target_page {
+                Some(p) => {
+                    evaluate_with_timeout(&p, &click_script)
+                        .await?
+                        .value()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                }
+                None => anyhow::bail!("Element [{}] not found in any frame", safe_id),
+            }
         };
-
-        let clicked = evaluate_with_timeout(&page, &click_script)
-            .await?
-            .value()
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
 
         if !clicked {
             anyhow::bail!("Element [{}] found but click failed", safe_id);
@@ -1090,34 +1354,73 @@ impl BrowserState {
         validate_target_id(target_id)?;
         validate_text(text)?;
         let safe_id = escape_js_string(target_id);
-        self.smart_scroll(&safe_id).await?;
+
+        let page = lock_with_timeout(&self.page, "page").await?.clone();
+
+        // Decode frame prefix (same as click)
+        let (target_frame_id, _) = if target_id.starts_with('f') {
+            if let Some(dash) = target_id.find('-') {
+                let idx_part = &target_id[1..dash];
+                let idx: usize = idx_part.parse().unwrap_or(0);
+                let frame_id = self.get_frame_id_at_index(idx).await?;
+                (Some(frame_id), ())
+            } else {
+                (None, ())
+            }
+        } else {
+            (None, ())
+        };
 
         let focus_script = format!(
             r#"(() => {{ const id = CSS.escape("{}"); const el = document.querySelector(`[data-agent-id="${{id}}"]`); if (!el) return false; el.scrollIntoView({{ block: 'center', behavior: 'instant' }}); el.focus(); if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{ el.value = ''; el.dispatchEvent(new Event('input', {{ bubbles: true }})); }} return true; }})()"#,
             safe_id
         );
 
-        let all_pages = cdp_op_with_timeout(self.browser.pages(), "pages_for_type")
-            .await
-            .unwrap_or_default();
-
-        let mut target_page: Option<Page> = None;
-        for page in &all_pages {
-            match tokio::time::timeout(EVALUATE_TIMEOUT, page.evaluate(focus_script.as_str())).await {
-                Ok(Ok(result)) => {
-                    if result.value().and_then(|v| v.as_bool()).unwrap_or(false) {
-                        target_page = Some(page.clone());
-                        break;
-                    }
-                }
-                _ => continue,
+        let focused = if let Some(ref frame_id) = target_frame_id {
+            let ctx_id = self.create_world_for_frame(frame_id).await?;
+            let eval_params = EvaluateParams::builder()
+                .expression(focus_script)
+                .context_id(ctx_id)
+                .return_by_value(true)
+                .await_promise(true)
+                .build()
+                .map_err(|e| anyhow::anyhow!("Failed to build EvaluateParams: {}", e))?;
+            match tokio::time::timeout(EVALUATE_TIMEOUT, page.execute(eval_params)).await {
+                Ok(Ok(resp)) => resp.result.result.value.and_then(|v| v.as_bool()).unwrap_or(false),
+                _ => false,
             }
-        }
-
-        let page = match target_page {
-            Some(p) => p,
-            None => anyhow::bail!("Element [{}] not found for typing in any frame", safe_id),
+        } else {
+            // Legacy: find in browser.pages()
+            let all_pages = cdp_op_with_timeout(self.browser.pages(), "pages_for_type")
+                .await
+                .unwrap_or_default();
+            let mut target_page: Option<Page> = None;
+            for p in &all_pages {
+                match tokio::time::timeout(EVALUATE_TIMEOUT, p.evaluate(focus_script.as_str())).await {
+                    Ok(Ok(result)) => {
+                        if result.value().and_then(|v| v.as_bool()).unwrap_or(false) {
+                            target_page = Some(p.clone());
+                            break;
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            match target_page {
+                Some(p) => {
+                    evaluate_with_timeout(&p, &focus_script)
+                        .await?
+                        .value()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                }
+                None => anyhow::bail!("Element [{}] not found for typing in any frame", safe_id),
+            }
         };
+
+        if !focused {
+            anyhow::bail!("Element [{}] not found for typing in any frame", safe_id);
+        }
 
         let char_count = text.chars().count();
         let delays: Vec<u64> = (0..char_count)
@@ -1249,10 +1552,258 @@ impl BrowserState {
         }
     }
 
+    /// Get the frameId at a given index from the stored snapshot.
+    /// This is safer than re-querying GetFrameTree because the frame tree
+    /// may change between extract_tree and click (lazy-load iframes, ads, etc.).
+    async fn get_frame_id_at_index(&self, idx: usize) -> Result<FrameId> {
+        let map = self.frame_map.lock().await;
+        map.get(&idx)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!(
+                "Frame index {} not in snapshot. The page may have changed since the last tree extraction. Please re-extract the tree.",
+                idx
+            ))
+    }
+
+    /// Create an isolated world for a frame and return the execution context ID.
+    async fn create_world_for_frame(&self, frame_id: &FrameId) -> Result<ExecutionContextId> {
+        let page = lock_with_timeout(&self.page, "page").await?.clone();
+        let create_world = CreateIsolatedWorldParams::builder()
+            .frame_id(frame_id.clone())
+            .world_name("agent_click")
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build CreateIsolatedWorldParams: {}", e))?;
+        let resp = cdp_op_with_timeout(page.execute(create_world), "create_isolated_world").await?;
+        Ok(resp.result.execution_context_id)
+    }
+
+    /// Scroll an element into view within a specific frame.
+    async fn scroll_in_frame(&self, frame_id: &FrameId, local_id: &str) -> Result<bool> {
+        let page = lock_with_timeout(&self.page, "page").await?.clone();
+        let ctx_id = self.create_world_for_frame(frame_id).await?;
+        let safe_local = escape_js_string(local_id);
+        let scroll_script = format!(
+            r#"(() => {{ const id = CSS.escape("{}"); const el = document.querySelector(`[data-agent-id$="-${{id}}"]`) || document.querySelector(`[data-agent-id="${{id}}"]`); if (!el) return false; el.scrollIntoView({{ block: 'center', behavior: 'instant' }}); return true; }})()"#,
+            safe_local
+        );
+        let eval_params = EvaluateParams::builder()
+            .expression(scroll_script)
+            .context_id(ctx_id)
+            .return_by_value(true)
+            .await_promise(true)
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build EvaluateParams: {}", e))?;
+        match tokio::time::timeout(EVALUATE_TIMEOUT, page.execute(eval_params)).await {
+            Ok(Ok(resp)) => Ok(resp.result.result.value.and_then(|v| v.as_bool()).unwrap_or(false)),
+            _ => Ok(false),
+        }
+    }
+
     pub async fn get_page_meta(&self) -> Result<serde_json::Value> {
         let page = lock_with_timeout(&self.page, "page").await?.clone();
         let result = evaluate_with_timeout(&page, PAGE_META_SCRIPT).await?;
         Ok(result.value().cloned().unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Extract page body content (readable text, not just interactive elements).
+    /// Uses a Readability-style algorithm to find the main content area.
+    pub async fn extract_content(&self) -> Result<serde_json::Value> {
+        let page = lock_with_timeout(&self.page, "page").await?.clone();
+        let result = evaluate_with_timeout(&page, EXTRACT_CONTENT_SCRIPT).await?;
+        let value = result.value().cloned().unwrap_or(serde_json::Value::Null);
+        Ok(value)
+    }
+
+    /// Wait for an element to appear on the page, by target_id, text content, or CSS selector.
+    /// Returns the element's target_id if found, or an error if timed out.
+    pub async fn wait_for_element(
+        &self,
+        by: &str,
+        value: &str,
+        timeout_ms: u64,
+    ) -> Result<serde_json::Value> {
+        let query = serde_json::json!({
+            "by": by,
+            "value": value,
+        });
+        let query_str = serde_json::to_string(&query)
+            .context("Failed to serialize wait query")?;
+
+        let script = WAIT_FOR_ELEMENT_SCRIPT
+            .replace("__AGENT_QUERY__", &query_str)
+            .replace("__AGENT_TIMEOUT__", &timeout_ms.to_string());
+
+        let page = lock_with_timeout(&self.page, "page").await?.clone();
+        let result = evaluate_with_timeout(&page, &script).await?;
+        let value = result.value().cloned().unwrap_or(serde_json::Value::Null);
+
+        // Check if the element was found
+        let found = value.as_object()
+            .and_then(|m| m.get("found"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if !found {
+            anyhow::bail!(
+                "Element not found within {}ms: by='{}', value='{}'",
+                timeout_ms, by, value
+            );
+        }
+
+        Ok(value)
+    }
+
+    /// Assert that an element identified by target_id contains the expected text.
+    /// Returns { passed, actual, target_id }.
+    pub async fn assert_element(
+        &self,
+        target_id: &str,
+        expected_text: &str,
+    ) -> Result<serde_json::Value> {
+        validate_target_id(target_id)?;
+
+        let safe_id = escape_js_string(target_id);
+        let safe_text = escape_js_string(expected_text);
+
+        let script = ASSERT_ELEMENT_SCRIPT
+            .replace("__AGENT_TARGET_ID__", &safe_id)
+            .replace("__AGENT_EXPECTED_TEXT__", &safe_text);
+
+        let page = lock_with_timeout(&self.page, "page").await?.clone();
+        let result = evaluate_with_timeout(&page, &script).await?;
+        let value = result.value().cloned().unwrap_or(serde_json::Value::Null);
+
+        Ok(value)
+    }
+
+    // ─── Download support ──────────────────────────────────────────────────
+
+    /// Enable download behavior on the browser.
+    /// Sets the download path and allows downloads to proceed.
+    /// After this, clicking a download link will save the file to the specified path.
+    pub async fn enable_download(&self, download_path: &str) -> Result<()> {
+        let params = SetDownloadBehaviorParams {
+            behavior: SetDownloadBehaviorBehavior::Allow,
+            browser_context_id: None,
+            download_path: Some(download_path.to_string()),
+            events_enabled: Some(true),
+        };
+
+        // Execute on the browser, not on a page
+        cdp_op_with_timeout(
+            self.browser.execute(params),
+            "enable_download",
+        )
+        .await
+        .context("Failed to set download behavior")?;
+
+        eprintln!("[download] Enabled download to: {}", download_path);
+        Ok(())
+    }
+
+    /// Click an element that triggers a file download, then wait for the download
+    /// to complete. Returns the download result with file info.
+    ///
+    /// This requires `enable_download` to have been called first with a valid path.
+    pub async fn click_and_download(
+        &self,
+        target_id: &str,
+        download_path: &str,
+        timeout_ms: u64,
+    ) -> Result<serde_json::Value> {
+        // First ensure download is enabled
+        self.enable_download(download_path).await?;
+
+        // Listen for download progress events on the browser
+        let (download_tx, mut download_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(1);
+
+        // Register a one-shot listener for the next download progress event
+        let dl_tx = download_tx.clone();
+        match self.browser.event_listener::<chromiumoxide::cdp::browser_protocol::browser::EventDownloadProgress>().await {
+            Ok(mut stream) => {
+                tokio::spawn(async move {
+                    while let Some(event) = stream.next().await {
+                        let state = event.state.as_ref().to_string();
+                        let info = serde_json::json!({
+                            "guid": event.guid,
+                            "total_bytes": event.total_bytes,
+                            "received_bytes": event.received_bytes,
+                            "state": state,
+                        });
+                        let _ = dl_tx.send(info).await;
+
+                        // Stop listening once download completes or cancels
+                        if state == "completed" || state == "canceled" {
+                            break;
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("[download] Failed to listen for download events: {}", e);
+            }
+        }
+
+        // Now click the element that triggers the download
+        let (_, _) = self.click(target_id).await?;
+
+        // Wait for the download to complete with timeout
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut last_state = serde_json::Value::Null;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(serde_json::json!({
+                    "status": "timeout",
+                    "target_id": target_id,
+                    "download_path": download_path,
+                    "last_state": last_state,
+                }));
+            }
+
+            match tokio::time::timeout(remaining, download_rx.recv()).await {
+                Ok(Some(progress)) => {
+                    let state = progress.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                    last_state = progress.clone();
+
+                    if state == "completed" {
+                        return Ok(serde_json::json!({
+                            "status": "ok",
+                            "target_id": target_id,
+                            "download_path": download_path,
+                            "guid": progress.get("guid"),
+                            "total_bytes": progress.get("total_bytes"),
+                        }));
+                    }
+                    if state == "canceled" {
+                        return Ok(serde_json::json!({
+                            "status": "canceled",
+                            "target_id": target_id,
+                            "download_path": download_path,
+                            "last_state": progress,
+                        }));
+                    }
+                }
+                Ok(None) => {
+                    break;
+                }
+                Err(_) => {
+                    return Ok(serde_json::json!({
+                        "status": "timeout",
+                        "target_id": target_id,
+                        "download_path": download_path,
+                        "last_state": last_state,
+                    }));
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "status": "ok",
+            "target_id": target_id,
+            "download_path": download_path,
+        }))
     }
 
     pub async fn close(&mut self) -> Result<()> {
@@ -1395,6 +1946,26 @@ impl BrowserState {
 
         if let Ok(mut known) = lock_with_timeout(&self.known_pages, "known_pages").await {
             *known = current_ids;
+        }
+    }
+}
+
+/// Information about a frame in the frame tree.
+struct FrameInfo {
+    frame_id: FrameId,
+    #[allow(dead_code)]
+    depth: usize,
+}
+
+/// Recursively collect frames from a FrameTree in tree order.
+fn collect_frames(tree: &FrameTree, frames: &mut Vec<FrameInfo>, depth: usize) {
+    frames.push(FrameInfo {
+        frame_id: tree.frame.id.clone(),
+        depth,
+    });
+    if let Some(ref children) = tree.child_frames {
+        for child in children {
+            collect_frames(child, frames, depth + 1);
         }
     }
 }

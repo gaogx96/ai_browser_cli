@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>OOPIF Dynamic Test</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
+  h1 { color: #333; }
+  .content { background: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+  iframe { width: 100%; height: 200px; border: 2px solid #007bff; border-radius: 8px; margin: 10px 0; }
+  button { margin: 5px; padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+</style>
+</head>
+<body>
+  <h1>OOPIF Dynamic Insertion Test</h1>
+  <div class="content">
+    <p>This page tests frame index stability after dynamic iframe insertion.</p>
+    <button id="main-btn">Main Button</button>
+  </div>
+  <iframe src="http://127.0.0.1:8081/oopif_frame.html" id="original-frame"></iframe>
+  <p id="status">Status: waiting for extract...</p>
+
+<script>
+  // MutationObserver: detect when extract_tree marks elements
+  const observer = new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      if (m.type === 'attributes' && m.attributeName === 'data-agent-id') {
+        // extract_tree has marked elements — insert a new iframe at the top
+        observer.disconnect();
+        document.getElementById('status').textContent = 'Status: extract detected, inserting intruder iframe...';
+        const newFrame = document.createElement('iframe');
+        newFrame.src = 'http://127.0.0.1:8082/other.html';
+        newFrame.id = 'intruder-frame';
+        document.body.insertBefore(newFrame, document.body.firstChild);
+        setTimeout(() => {
+          document.getElementById('status').textContent = 'Status: intruder iframe inserted, frame indices shifted. Ready for click test.';
+        }, 500);
+        break;
+      }
+    }
+  });
+  observer.observe(document.body, { subtree: true, attributes: true, attributeFilter: ['data-agent-id'] });
+</script>
+</body>
+</html>
