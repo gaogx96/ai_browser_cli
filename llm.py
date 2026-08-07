@@ -45,19 +45,28 @@ AGENT_SYSTEM_PROMPT = r"""你是一个通过无障碍语义树（Accessibility T
 6. stop：任务完成或遇到无法逾越的障碍时终止循环。
    参数：{"action":"stop","reason":"成功完成任务/失败原因"}
 
-## 思维模型（Thought-Before-Action）
-
-在输出动作前，必须在 thought 字段中说明：
-1. 当前观察：我在什么页面？任务进度？
-2. 风险排查：目标元素是否在 frame 内？页面是否报错？
-3. 行动决策：下一步最优操作是什么？
+7. pause：需要用户介入时暂停（如验证码、登录墙、文件选择）。
+   参数：{"action":"pause","reason":"需要用户处理验证码"}
 
 ## 输出格式约束
 
 必须且只能输出一个合法的单行 JSON 字典，不带 Markdown 包裹块。
 
+### 基础格式（旧版兼容）
 输出格式示例：
 {"thought":"当前在登录页。需要先输入账号。","action":"type","target_id":"e0","text":"my_account"}
+
+### 结构化格式（推荐，当【Agent 状态】块存在时使用）
+当输入中包含【Agent 状态】块时，请使用以下格式输出：
+{"thought":"当前观察和推理","evaluation_previous_goal":"上一步目标的完成情况：已完成/部分完成/失败/不适用","next_goal":"下一步要完成的具体目标","action":"click","target_id":"e5"}
+
+## 目标管理指导
+
+当输入中包含【Agent 状态】块时：
+- 评估上一步目标是否完成（evaluation_previous_goal）
+- 基于当前页面状态和任务进度，提出下一步目标（next_goal）
+- 避免重复已经完成的目标
+- 如果上一步目标部分完成，在 next_goal 中继续完成它
 
 ## 错误恢复指导
 
@@ -65,7 +74,7 @@ AGENT_SYSTEM_PROMPT = r"""你是一个通过无障碍语义树（Accessibility T
 - 如果 navigate 后页面树为空，等 1-2 秒再重试。
 - 如果同一元素连续失败 3 次，放弃该策略，换其他方式。
 - 对于下载场景：先 download_setup，再点击下载按钮。如果下载按钮被 JS 拦截，改用 evaluate 触发下载。
-- 遇到验证码/登录墙/风控时，立即 stop。
+- 遇到验证码/登录墙/风控时，使用 pause 让用户处理。
 
 ## 实战范例
 
@@ -77,7 +86,10 @@ AGENT_SYSTEM_PROMPT = r"""你是一个通过无障碍语义树（Accessibility T
 当页面树中链接被截断（末尾有...），用 evaluate 获取完整 href：
 {"thought":"链接被截断，用 evaluate 获取完整 URL","action":"evaluate","expression":"document.querySelector('a[href*=\"alidocs\"]').href"}
 
-范例 C（完成）：
+范例 C（结构化格式 + 目标管理）：
+{"thought":"登录页，需要先输入账号","evaluation_previous_goal":"不适用，第一步","next_goal":"输入账号","action":"type","target_id":"e0","text":"user@test.com"}
+
+范例 D（完成）：
 {"thought":"任务已完成","action":"stop","reason":"需求文档已下载到桌面"}
 """
 
@@ -122,8 +134,13 @@ class LLMClient:
         tree: str,
         meta: dict,
         history: list,
+        extra_context: str | None = None,
     ) -> dict[str, Any]:
-        """给定任务、页面树、元数据、历史，返回下一步动作 JSON。"""
+        """给定任务、页面树、元数据、历史，返回下一步动作 JSON。
+
+        extra_context: 可选的 AgentState 结构化上下文。提供时优先于原始 history，
+        用于滚动式目标分解（current_goal / next_goal / completed_goals）。
+        """
 
         history_text = "\n".join(
             f"Step {h['step']}: action={json.dumps(h['action'], ensure_ascii=False)} "
@@ -133,7 +150,23 @@ class LLMClient:
 
         page_info = f"当前 URL: {meta.get('url', '')}\n标题: {meta.get('title', '')}\n交互元素数: {meta.get('interactiveCount', 0)}"
 
-        user_prompt = f"""用户任务：{task}
+        if extra_context:
+            # 结构化上下文模式（阶段 4）：用 AgentState 提供滚动式目标分解
+            user_prompt = f"""用户任务：{task}
+
+{page_info}
+
+当前页面树：
+{tree}
+
+【Agent 状态】
+{extra_context}
+
+请输出下一步动作（单行 JSON，不要 Markdown 包裹块）。输出格式：
+{{"thought":"...","evaluation_previous_goal":"上一步目标评估","next_goal":"下一步要完成的目标","action":"click","target_id":"e5"}}"""
+        else:
+            # 旧模式：直接用 history 列表
+            user_prompt = f"""用户任务：{task}
 
 {page_info}
 
@@ -198,7 +231,7 @@ class LLMClient:
             action = {"action": "stop", "reason": f"LLM 输出缺少 action 字段: {raw[:200]}"}
 
         # 校验 action 值合法性
-        valid_actions = {"navigate", "click", "type", "evaluate", "download_setup", "stop"}
+        valid_actions = {"navigate", "click", "type", "evaluate", "download_setup", "stop", "pause"}
         if action["action"] not in valid_actions:
             action = {"action": "stop", "reason": f"LLM 输出了非法 action: {action.get('action')}"}
 
