@@ -485,10 +485,18 @@ class AgentState:
             self.next_goal = next_goal
             return
 
+        # 去重检查：同一规范化目标在最近 5 步内出现过 → 标记重复
+        deduplicated = False
+        recent_goals = [t["to"] for t in self.goal_transitions[-5:]]
+        for recent in recent_goals:
+            if self._normalize_goal(recent) == norm_next:
+                deduplicated = True
+                break
+
         # 检查 LLM 是否表示上一目标已完成
         eval_text = decision.evaluation_previous_goal
         if self._evaluation_says_completed(eval_text):
-            # 推进目标
+            # 推进目标（去重检查）
             self.previous_goal = self.current_goal
             self.current_goal = next_goal
             self.next_goal = None
@@ -498,6 +506,7 @@ class AgentState:
                 "to": next_goal,
                 "reason": f"evaluation: {eval_text[:50]}",
                 "step": self.step,
+                "deduplicated": deduplicated,
             })
         else:
             # 暂存为 next_goal，不覆盖 current_goal
@@ -1316,8 +1325,16 @@ class AgentRunner:
     # ── 循环防护（重复 no_effect 动作检测） ──────────────────────────────
 
     def _no_effect_signature(self, decision: Decision, page_fingerprint: str | None) -> str:
-        """生成动作签名，用于检测重复 no_effect 动作。"""
-        return f"{decision.action_type}:{decision.target_id}:{page_fingerprint or ''}"
+        """生成动作签名，用于检测重复 no_effect 动作。
+
+        使用有限长度的短摘要（action_type + target_id + URL + fingerprint digest），
+        避免把完整 DOM 指纹放入 key / 日志。
+        """
+        import hashlib
+        digest = ""
+        if page_fingerprint:
+            digest = hashlib.sha256(page_fingerprint.encode("utf-8")).hexdigest()[:12]
+        return f"{decision.action_type}:{decision.target_id}:{digest}"
 
     def _handle_loop_guard(self, decision: Decision, verification: ActionVerification | None,
                            after: PageSnapshot | None) -> RecoveryDecision | None:
