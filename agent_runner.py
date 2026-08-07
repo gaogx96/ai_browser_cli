@@ -868,7 +868,10 @@ class AgentRunner:
                         after=after,
                         effects=effects,
                     )
-                    self._log_assessment(assessment, applied=False)
+                    self._log_assessment(
+                        assessment, applied=False,
+                        action_type=decision.action_type,
+                    )
             else:
                 after = None
                 verification = None
@@ -1009,18 +1012,20 @@ class AgentRunner:
     def _emit_event(self, event_type: str, data: dict) -> None:
         """发出结构化事件。根据 AGENT_OBSERVABILITY 决定输出格式。
 
-        事件包含关联 ID（session_id, step, action_type），不含敏感字段。
+        事件包含关联 ID（session_id, step, action_id, timestamp），不含敏感字段。
         支持 stderr（文本）和 jsonl（结构化 JSON）两种格式。
         """
         if self._observability == "off":
             return
 
         self._event_count += 1
+        import time as _time
         event = {
             "event": event_type,
             "seq": self._event_count,
             "session_id": self.state.session_id if self.state and hasattr(self.state, 'session_id') else "",
             "step": self.state.step if self.state else 0,
+            "timestamp": _time.time(),
         }
         event.update(data)
 
@@ -1051,11 +1056,34 @@ class AgentRunner:
                     parts.append(f"{k}=none")
             _log(" ".join(parts))
 
-    def _log_assessment(self, assessment: GoalAssessment, applied: bool = False) -> None:
-        """记录评估结果。结构化 + 文本双输出。"""
+    def _log_assessment(self, assessment: GoalAssessment, applied: bool = False,
+                    action_type: str = "", duration_ms: int = 0) -> None:
+        """记录评估结果。结构化 + 文本双输出。
+
+        applied: 评估是否被应用到状态更新（shadow 模式始终 False）。
+        rejected_reason: 如果评估未应用，说明原因。
+        """
+        # 计算拒绝原因（shadow 模式始终未应用）
+        rejected_reason = None
+        apply_reason = None
+        if not applied:
+            if assessment.status != "completed":
+                rejected_reason = f"status_{assessment.status}"
+            elif assessment.source == "llm":
+                rejected_reason = "llm_only_without_rule_evidence"
+            elif assessment.confidence < 0.7:
+                rejected_reason = f"low_confidence_{assessment.confidence:.2f}"
+            elif assessment.required_confirmation:
+                rejected_reason = "requires_confirmation"
+            else:
+                rejected_reason = "shadow_mode"
+        else:
+            apply_reason = f"{assessment.source}_{assessment.evidence[0].kind if assessment.evidence else 'unknown'}"
+
         # 结构化事件
         self._emit_event("goal_assessment", {
             "goal": str(assessment.goal or ""),
+            "action_type": action_type,
             "status": assessment.status,
             "confidence": round(assessment.confidence, 2),
             "source": assessment.source,
@@ -1064,6 +1092,9 @@ class AgentRunner:
             "evidence_kinds": [e.kind for e in assessment.evidence],
             "evidence_count": len(assessment.evidence),
             "applied": applied,
+            "apply_reason": apply_reason,
+            "rejected_reason": rejected_reason,
+            "duration_ms": duration_ms,
         })
         # 文本日志（兼容）
         _log(
