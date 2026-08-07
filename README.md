@@ -114,6 +114,9 @@ python agent_runner.py "打开 https://example.com 并读取标题"
 | `AGENT_CONTEXT_MODE` | `dual` | 上下文模式：`legacy`（旧 history）/ `dual`（双写）/ `structured`（仅结构化） |
 | `AGENT_VERIFY_MODE` | `shadow` | 验证模式：`off` / `shadow`（只记录）/ `active` |
 | `AGENT_RECOVERY_MODE` | `off` | 恢复模式：`off` / `shadow` / `active` |
+| `AGENT_GOAL_ASSESSMENT` | `off` | 目标评估模式：`off` / `shadow`（只记录）/ `active` |
+| `AGENT_OBSERVABILITY` | `stderr` | 可观测性输出：`off` / `stderr`（文本）/ `jsonl`（结构化 JSON） |
+| `AGENT_OBSERVABILITY_PATH` | `""` | JSONL 输出文件路径（为空时 jsonl 输出到 stderr） |
 | `AGENT_MAX_STEPS` | `15` | 最大步数 |
 | `AGENT_LLM_DELAY` | `0` | LLM 调用间延迟（秒），用于低配额 API |
 

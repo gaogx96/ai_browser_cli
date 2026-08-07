@@ -410,6 +410,7 @@ class AgentState:
     failed_attempts: list[str] = field(default_factory=list)
     last_observation_summary: str = ""
     step: int = 0
+    session_id: str = ""  # P8-D：用于事件关联
 
     # 观察页面并更新最近观察摘要
     def observe(self, tree: str, meta: dict) -> None:
@@ -761,6 +762,13 @@ class AgentRunner:
         self._goal_assessment_mode = os.environ.get("AGENT_GOAL_ASSESSMENT", "off").lower()
         # off | shadow | active — 默认 off，shadow 只记录不干预
 
+        # P8-D：可观测性配置
+        self._observability = os.environ.get("AGENT_OBSERVABILITY", "stderr").lower()
+        # off | stderr | jsonl — 默认 stderr，jsonl 适合统计/误判分析
+        self._observability_path = os.environ.get("AGENT_OBSERVABILITY_PATH", "")
+        # jsonl 输出文件路径；为空则用 stderr
+        self._event_count = 0
+
     async def run(self, task: str, initial_state: AgentState | None = None) -> AgentResult:
         """执行一个自然语言浏览器任务。
 
@@ -958,7 +966,17 @@ class AgentRunner:
         )
 
     def _log_verification(self, verification: ActionVerification, effects: ActionEffects) -> None:
-        """记录验证结果到 stderr（shadow mode 只记录，不干预决策）。"""
+        """记录验证结果。结构化 + 文本双输出（shadow mode 只记录，不干预决策）。"""
+        # 结构化事件
+        self._emit_event("action_verification", {
+            "status": verification.status,
+            "transport_ok": verification.transport_ok,
+            "page_responded": verification.page_responded,
+            "expected_effect_seen": verification.expected_effect_seen,
+            "error_kind": verification.error_kind.value if verification.error_kind else None,
+            "effects": effects.to_dict(),
+        })
+        # 文本日志
         _log(
             f"  [verify] status={verification.status} "
             f"transport={verification.transport_ok} "
@@ -986,8 +1004,68 @@ class AgentRunner:
             current_goal=current_goal,
         )
 
+    # ── P8-D：可观测性 ──────────────────────────────────────────────────
+
+    def _emit_event(self, event_type: str, data: dict) -> None:
+        """发出结构化事件。根据 AGENT_OBSERVABILITY 决定输出格式。
+
+        事件包含关联 ID（session_id, step, action_type），不含敏感字段。
+        支持 stderr（文本）和 jsonl（结构化 JSON）两种格式。
+        """
+        if self._observability == "off":
+            return
+
+        self._event_count += 1
+        event = {
+            "event": event_type,
+            "seq": self._event_count,
+            "session_id": self.state.session_id if self.state and hasattr(self.state, 'session_id') else "",
+            "step": self.state.step if self.state else 0,
+        }
+        event.update(data)
+
+        if self._observability == "jsonl":
+            line = json.dumps(event, ensure_ascii=False)
+            if self._observability_path:
+                try:
+                    with open(self._observability_path, "a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                except OSError:
+                    _log(f"[event] write error: {self._observability_path}")
+            else:
+                # jsonl 到 stderr
+                _log(f"[event] {line}")
+        else:
+            # stderr 文本格式
+            parts = [f"[{event_type}]"]
+            for k, v in data.items():
+                if isinstance(v, float):
+                    parts.append(f"{k}={v:.2f}")
+                elif isinstance(v, bool):
+                    parts.append(f"{k}={v}")
+                elif isinstance(v, (int, str)):
+                    parts.append(f"{k}={v}")
+                elif isinstance(v, list):
+                    parts.append(f"{k}_count={len(v)}")
+                elif v is None:
+                    parts.append(f"{k}=none")
+            _log(" ".join(parts))
+
     def _log_assessment(self, assessment: GoalAssessment, applied: bool = False) -> None:
-        """记录评估结果到 stderr。shadow 模式只记录，不改变行为。"""
+        """记录评估结果。结构化 + 文本双输出。"""
+        # 结构化事件
+        self._emit_event("goal_assessment", {
+            "goal": str(assessment.goal or ""),
+            "status": assessment.status,
+            "confidence": round(assessment.confidence, 2),
+            "source": assessment.source,
+            "stable": assessment.stable,
+            "required_confirmation": assessment.required_confirmation,
+            "evidence_kinds": [e.kind for e in assessment.evidence],
+            "evidence_count": len(assessment.evidence),
+            "applied": applied,
+        })
+        # 文本日志（兼容）
         _log(
             f"  [goal] goal={assessment.goal or ''} "
             f"status={assessment.status} "
@@ -1084,7 +1162,7 @@ class AgentRunner:
         return RecoveryDecision(kind="none", reason=f"unhandled error: {error_kind.value}")
 
     def _log_recovery(self, recovery: RecoveryDecision, decision: Decision, result: dict) -> None:
-        """记录恢复决策到 stderr。不输出敏感信息。"""
+        """记录恢复决策。结构化 + 文本双输出。不输出敏感信息。"""
         action_type = decision.action_type
         target_id = decision.target_id
         data = result.get("data", {})
@@ -1092,6 +1170,19 @@ class AgentRunner:
             error = str(data.get("error", ""))[:60]
         else:
             error = str(result.get("error", ""))[:60]
+
+        # 结构化事件
+        self._emit_event("recovery_decision", {
+            "mode": self._recovery_mode,
+            "kind": recovery.kind,
+            "action_type": action_type,
+            "target_id": target_id,
+            "error_preview": error,
+            "reason": recovery.reason,
+            "retry_action": recovery.retry_action,
+            "force_reobserve": recovery.force_reobserve,
+        })
+        # 文本日志
         _log(
             f"  [recover] mode={self._recovery_mode} "
             f"kind={recovery.kind} "
@@ -1139,6 +1230,13 @@ class AgentRunner:
             pause_reason=pause_reason,
             snapshot_available=snapshot_available,
         )
+        # P8-D：checkpoint 生命周期事件
+        self._emit_event("checkpoint_created", {
+            "checkpoint_id": ck.checkpoint_id,
+            "pause_reason": pause_reason,
+            "page_url": page_url,
+            "snapshot_available": snapshot_available,
+        })
         _log(f"  [checkpoint] created id={ck.checkpoint_id} reason={pause_reason} url={page_url}")
         return ck
 
@@ -1195,6 +1293,12 @@ class AgentRunner:
 
         # 判断页面匹配
         match = await self._match_checkpoint(checkpoint, observation)
+        # P8-D：resume 事件
+        self._emit_event("resume_attempted", {
+            "checkpoint_id": checkpoint.checkpoint_id,
+            "page_match": match.value,
+            "page_url": meta.get('url', ''),
+        })
         _log(f"  [resume] 页面匹配: {match.value} (url={meta.get('url', '')})")
 
         if match == PageMatchLevel.NONE:
