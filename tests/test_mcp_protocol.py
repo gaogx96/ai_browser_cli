@@ -316,6 +316,23 @@ class TestMCPProtocol(unittest.TestCase):
             self.assertIn("error", resp)
         asyncio.run(run())
 
+    def test_agent_resume_error_structured_code(self):
+        """agent_resume 错误返回结构化错误码（非模糊字符串）。"""
+        async def run():
+            from mcp_server import ResumeErrorCode
+            resp = await self._run_client({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "agent_resume", "arguments": {}},
+            })
+            content = resp.get("result", {}).get("content", [])
+            if content:
+                data = json.loads(content[0]["text"])
+                error = data.get("error", {})
+                self.assertIn("code", error, "错误响应缺少 code 字段")
+                self.assertIn("message", error, "错误响应缺少 message 字段")
+                self.assertEqual(error["code"], ResumeErrorCode.CHECKPOINT_NOT_FOUND.value)
+        asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

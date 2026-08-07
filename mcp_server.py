@@ -608,9 +608,24 @@ class AgentBrowserMCPServer:
                 )
                 # Return as TextContent list (unstructured content)
                 return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+            except ResumeError as exc:
+                # 结构化错误码：agent_resume 专用错误
+                error_body = {
+                    "error": {
+                        "code": exc.code.value,
+                        "message": exc.message,
+                    }
+                }
+                _log(f"[mcp] ResumeError: code={exc.code.value} msg={exc.message}")
+                return [TextContent(type="text", text=json.dumps(error_body, ensure_ascii=False))]
             except RuntimeError as e:
-                # Return error as CallToolResult with isError flag
+                # 通用错误
+                _log(f"[mcp] RuntimeError: {e}")
                 raise RuntimeError(str(e))
+            except Exception as e:
+                # 兜底：防止未捕获异常逃逸到 JSON-RPC 传输层
+                _log(f"[mcp] Unexpected error: {e}")
+                raise RuntimeError(f"Internal error: {e}")
 
 
 async def dispatch(
