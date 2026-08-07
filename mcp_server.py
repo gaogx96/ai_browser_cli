@@ -206,15 +206,22 @@ class StoredCheckpoint:
 
 
 class CheckpointStore:
-    """内存 checkpoint 存储：put / get / consume / expire。"""
+    """内存 checkpoint 存储：put / get / consume / expire。
+
+    使用 asyncio.Lock 保证 consume() 的原子性（防止并发重复恢复）。
+    TTL 过期：创建时设置 TTL，读取时惰性检查。后台清理任务定期扫描。
+    """
+
+    TTL_SECONDS = 3600  # 默认 1 小时过期
 
     def __init__(self) -> None:
         self._store: dict[str, StoredCheckpoint] = {}
+        self._lock = asyncio.Lock()
 
     async def put(self, checkpoint: Any, session_id: str) -> str:
         """保存 checkpoint，返回 checkpoint_id。"""
-        ck_id = checkpoint.checkpoint_id or secrets.token_urlsafe(24)
         import time
+        ck_id = checkpoint.checkpoint_id or secrets.token_urlsafe(24)
         self._store[ck_id] = StoredCheckpoint(
             checkpoint_id=ck_id,
             session_id=session_id,
@@ -225,21 +232,35 @@ class CheckpointStore:
         return ck_id
 
     async def get(self, checkpoint_id: str) -> StoredCheckpoint | None:
-        return self._store.get(checkpoint_id)
+        ck = self._store.get(checkpoint_id)
+        if ck is None:
+            return None
+        # 惰性过期检查
+        import time
+        if ck.status in (CheckpointStatus.PAUSED, CheckpointStatus.RESUMING) and \
+           time.time() - ck.created_at > self.TTL_SECONDS:
+            ck.status = CheckpointStatus.EXPIRED
+        return ck
 
     async def consume(self, checkpoint_id: str) -> StoredCheckpoint | None:
         """原子领取：把 checkpoint 从 paused 改为 resuming，防止并发重复恢复。
 
+        asyncio.Lock 保证 check-then-act 的原子性。
         只在状态为 PAUSED 时成功领取（返回对象并置为 RESUMING）。
         否则返回 None（已被领取/已恢复/已过期），调用方据此判断冲突。
         """
-        ck = self._store.get(checkpoint_id)
-        if ck is None:
-            return None
-        if ck.status != CheckpointStatus.PAUSED:
-            return None  # 非 PAUSED，无法领取
-        ck.status = CheckpointStatus.RESUMING
-        return ck
+        async with self._lock:
+            ck = self._store.get(checkpoint_id)
+            if ck is None:
+                return None
+            # 惰性过期检查
+            import time
+            if time.time() - ck.created_at > self.TTL_SECONDS:
+                ck.status = CheckpointStatus.EXPIRED
+            if ck.status != CheckpointStatus.PAUSED:
+                return None  # 非 PAUSED，无法领取
+            ck.status = CheckpointStatus.RESUMING
+            return ck
 
     async def mark_resumed(self, checkpoint_id: str) -> None:
         if checkpoint_id in self._store:
@@ -253,6 +274,19 @@ class CheckpointStore:
         if checkpoint_id in self._store:
             self._store[checkpoint_id].status = CheckpointStatus.EXPIRED
 
+    async def cleanup_expired(self) -> int:
+        """清理所有过期 checkpoint（从 store 中移除）。返回清理数量。"""
+        import time
+        now = time.time()
+        expired_ids = [
+            ck_id for ck_id, ck in self._store.items()
+            if ck.status in (CheckpointStatus.EXPIRED, CheckpointStatus.RESUMED, CheckpointStatus.SUPERSEDED)
+            or (now - ck.created_at > self.TTL_SECONDS * 2)
+        ]
+        for ck_id in expired_ids:
+            del self._store[ck_id]
+        return len(expired_ids)
+
 
 @dataclass
 class AgentSession:
@@ -265,22 +299,51 @@ class AgentSession:
 
 
 class SessionRegistry:
-    """session_id → AgentSession 映射。恢复时复用原浏览器会话。"""
+    """session_id → AgentSession 映射。恢复时复用原浏览器会话。
+
+    session 在以下情况自动清理：
+    - 任务正常完成（run_task 返回 success）
+    - 任务最终失败（run_task 返回 failed）
+    - resume 失败（恢复异常）
+    - 显式 remove()
+    - cleanup_stale() 定期清理（用于浏览器断开等）
+    """
+
+    TTL_SECONDS = 3600  # 默认 1 小时无活动自动清理
 
     def __init__(self) -> None:
         self._sessions: dict[str, AgentSession] = {}
+        self._last_activity: dict[str, float] = {}
 
     def register(self, session: AgentSession) -> None:
         self._sessions[session.session_id] = session
+        import time
+        self._last_activity[session.session_id] = time.time()
 
     def get(self, session_id: str) -> AgentSession | None:
+        if session_id in self._sessions:
+            import time
+            self._last_activity[session_id] = time.time()
         return self._sessions.get(session_id)
 
     def remove(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
+        self._last_activity.pop(session_id, None)
 
     def has(self, session_id: str) -> bool:
         return session_id in self._sessions
+
+    async def cleanup_stale(self) -> int:
+        """清理过期 session（TTL 超时）。返回清理数量。"""
+        import time
+        now = time.time()
+        stale_ids = [
+            sid for sid, last in self._last_activity.items()
+            if now - last > self.TTL_SECONDS
+        ]
+        for sid in stale_ids:
+            self.remove(sid)
+        return len(stale_ids)
 
 
 # MCP 错误码
