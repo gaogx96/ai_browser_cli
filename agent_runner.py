@@ -752,14 +752,14 @@ class AgentRunner:
                 force_reobserve=True,
             )
 
-        # NAVIGATION_TIMEOUT → 检查 URL 是否已变化
+        # NAVIGATION_TIMEOUT → 检查 URL 是否已到达目标
         if error_kind == ErrorKind.NAVIGATION_TIMEOUT:
-            # 判断 URL 是否已到达目标或已变化（非 about:blank）
+            # 导航超时：只有 after 的 URL 已到达目标 URL 时才视为可能成功。
+            # 注意：after_url 可能是上一个导航的 URL（如 a.com），
+            # 不等于当前目标（b.com），此时应重试而非误判为"已变化"。
             target_url = decision.url or ""
             after_url = after.url if after and after.snapshot_ok else ""
-            url_reached = bool(after_url) and (after_url == target_url or (
-                after_url != "about:blank" and after_url != target_url
-            ))
+            url_reached = bool(target_url) and bool(after_url) and after_url == target_url
             if url_reached:
                 # URL 已变化，视为可能成功，继续
                 return RecoveryDecision(
