@@ -548,6 +548,176 @@ class PageMatchLevel(enum.Enum):
     NONE = "none"      # URL 完全不同 / 错误页
 
 
+# ── P8-C：GoalAssessment ──────────────────────────────────────────────────
+# 数据模型和纯函数。先 shadow 只记录，不改变行为。
+
+
+@dataclass
+class GoalEvidence:
+    """目标完成的证据。"""
+    kind: str  # url_match | element_present | text_present | download_detected | form_state | llm_judgment
+    detail: str  # 具体描述（如 "URL 到达目标页面 https://example.com"）
+    weight: float = 1.0  # 证据权重
+
+
+@dataclass
+class GoalAssessment:
+    """目标完成评估结果。
+
+    status:
+      completed  — 有足够证据认为目标已完成
+      partial    — 目标只完成一部分
+      failed     — 页面或动作明确表明目标失败
+      unknown    — 当前证据不足，不能判断
+    """
+    goal: str | None = None
+    status: str = "unknown"
+    confidence: float = 0.0
+    evidence: list[GoalEvidence] = field(default_factory=list)
+    source: str = "unknown"  # rule | llm | combined
+    stable: bool = False  # 是否连续多次评估一致
+    required_confirmation: bool = False  # 是否需要用户确认
+
+    def to_dict(self) -> dict:
+        return {
+            "goal": self.goal,
+            "status": self.status,
+            "confidence": round(self.confidence, 2),
+            "evidence_count": len(self.evidence),
+            "source": self.source,
+            "stable": self.stable,
+            "required_confirmation": self.required_confirmation,
+        }
+
+
+# 显式规则证据：根据动作类型和页面状态生成
+def assess_from_rules(action_type: str, before: PageSnapshot | None, after: PageSnapshot | None,
+                      effects: ActionEffects | None, current_goal: str | None) -> GoalAssessment:
+    """根据显式规则评估目标是否完成。不依赖 LLM，纯规则判断。
+
+    规则覆盖：
+    - navigate: URL 到达目标
+    - click: URL 变化 / 新标签页 / DOM 变化
+    - type: 表单状态变化
+    """
+    effects = effects or ActionEffects()
+    evidence: list[GoalEvidence] = []
+    status = "unknown"
+    confidence = 0.0
+
+    if action_type == "navigate":
+        if effects.url_changed:
+            evidence.append(GoalEvidence("url_match", "URL 已发生变化", weight=0.9))
+        if effects.title_changed:
+            evidence.append(GoalEvidence("text_present", "页面标题已变化", weight=0.5))
+        if evidence:
+            status = "completed"
+            confidence = min(0.5 + 0.4 * len(evidence), 0.95)
+
+    elif action_type == "click":
+        if effects.url_changed:
+            evidence.append(GoalEvidence("url_match", "点击后 URL 已变化", weight=0.8))
+        if effects.new_targets:
+            evidence.append(GoalEvidence("element_present", "新标签页已打开", weight=0.9))
+        if effects.dom_changed:
+            evidence.append(GoalEvidence("element_present", "页面 DOM 已变化", weight=0.5))
+        if evidence:
+            status = "completed"
+            confidence = min(0.3 + 0.5 * len(evidence), 0.9)
+
+    elif action_type == "type":
+        if effects.form_changed:
+            evidence.append(GoalEvidence("form_state", "表单状态已变化", weight=0.7))
+            status = "completed"
+            confidence = 0.7
+
+    return GoalAssessment(
+        goal=current_goal,
+        status=status if evidence else "unknown",
+        confidence=confidence,
+        evidence=evidence,
+        source="rule",
+        stable=True,
+    )
+
+
+def merge_rule_and_llm_assessment(
+    rule_assessment: GoalAssessment,
+    llm_assessment: GoalAssessment | None,
+) -> GoalAssessment:
+    """合并规则评估和 LLM 评估。规则证据优先于 LLM 判断。"""
+    if not llm_assessment or llm_assessment.status == "unknown":
+        # 规则有证据但 LLM 不确认 → 仍需确认
+        if rule_assessment.status == "completed":
+            return GoalAssessment(
+                goal=rule_assessment.goal,
+                status="completed",
+                confidence=rule_assessment.confidence * 0.8,
+                evidence=rule_assessment.evidence,
+                source=rule_assessment.source,
+                stable=True,
+                required_confirmation=True,
+            )
+        return rule_assessment
+
+    if rule_assessment.status == "completed" and llm_assessment.status == "completed":
+        # 双方一致 → 高置信度
+        evidence = rule_assessment.evidence + llm_assessment.evidence
+        confidence = min(rule_assessment.confidence + llm_assessment.confidence * 0.3, 0.99)
+        return GoalAssessment(
+            goal=rule_assessment.goal or llm_assessment.goal,
+            status="completed",
+            confidence=confidence,
+            evidence=evidence,
+            source="combined",
+            stable=True,
+        )
+
+    if rule_assessment.status == "completed" and llm_assessment.status != "completed":
+        # 规则证据明确，但 LLM 不确认 → 仍接受规则判断
+        return GoalAssessment(
+            goal=rule_assessment.goal,
+            status="completed",
+            confidence=rule_assessment.confidence * 0.8,
+            evidence=rule_assessment.evidence,
+            source="rule",
+            stable=True,
+            required_confirmation=True,
+        )
+
+    if rule_assessment.status == "unknown" and llm_assessment.status == "completed":
+        # 规则无证据，但 LLM 认为完成 → 低置信度，标记为 partial
+        return GoalAssessment(
+            goal=llm_assessment.goal,
+            status="partial",
+            confidence=llm_assessment.confidence * 0.5,
+            evidence=llm_assessment.evidence,
+            source="llm",
+            stable=False,
+            required_confirmation=True,
+        )
+
+    # 双方都 unknown → 保持 unknown
+    return rule_assessment
+
+
+def should_accept_completion(assessment: GoalAssessment) -> bool:
+    """判断是否应接受目标完成评估。
+
+    规则证据明确 + 高置信度 → 接受
+    LLM-only + 低置信度 → 不自动接受
+    """
+    if assessment.status != "completed":
+        return False
+    if assessment.source == "rule" and assessment.confidence >= 0.7:
+        return True
+    if assessment.source == "combined" and assessment.confidence >= 0.85:
+        return True
+    if assessment.source == "llm" and assessment.confidence >= 0.9 and assessment.stable:
+        return True
+    return False
+
+
 # ── Agent Runner ───────────────────────────────────────────────────────────
 
 
@@ -586,6 +756,10 @@ class AgentRunner:
         self._recovery_mode = os.environ.get("AGENT_RECOVERY_MODE", "off").lower()
         # off | shadow | active — 默认 off 保留旧逻辑
         self._recovery_retry_counts: dict[str, int] = {}  # 按 action_id 计数，非全局
+
+        # P8-C：GoalAssessment 配置
+        self._goal_assessment_mode = os.environ.get("AGENT_GOAL_ASSESSMENT", "off").lower()
+        # off | shadow | active — 默认 off，shadow 只记录不干预
 
     async def run(self, task: str, initial_state: AgentState | None = None) -> AgentResult:
         """执行一个自然语言浏览器任务。
@@ -677,6 +851,16 @@ class AgentRunner:
                     effects=effects,
                 )
                 self._log_verification(verification, effects)
+
+                # P8-C：GoalAssessment shadow（仅记录，不干预）
+                if self._goal_assessment_mode != "off":
+                    assessment = self._assess_goal(
+                        action_type=decision.action_type,
+                        before=before,
+                        after=after,
+                        effects=effects,
+                    )
+                    self._log_assessment(assessment, applied=False)
             else:
                 after = None
                 verification = None
@@ -781,6 +965,36 @@ class AgentRunner:
             f"responded={verification.page_responded} "
             f"expected={verification.expected_effect_seen} "
             f"effects={effects.to_dict()}"
+        )
+
+    # ── P8-C：GoalAssessment ─────────────────────────────────────────────
+
+    def _assess_goal(
+        self,
+        action_type: str,
+        before: PageSnapshot | None,
+        after: PageSnapshot | None,
+        effects: ActionEffects | None,
+    ) -> GoalAssessment:
+        """评估当前目标是否完成。基于显式规则，不依赖 LLM。"""
+        current_goal = self.state.current_goal if self.state else None
+        return assess_from_rules(
+            action_type=action_type,
+            before=before,
+            after=after,
+            effects=effects,
+            current_goal=current_goal,
+        )
+
+    def _log_assessment(self, assessment: GoalAssessment, applied: bool = False) -> None:
+        """记录评估结果到 stderr。shadow 模式只记录，不改变行为。"""
+        _log(
+            f"  [goal] goal={assessment.goal or ''} "
+            f"status={assessment.status} "
+            f"confidence={assessment.confidence:.2f} "
+            f"source={assessment.source} "
+            f"evidence_count={len(assessment.evidence)} "
+            f"applied={applied}"
         )
 
     # ── 阶段 5：错误恢复 ─────────────────────────────────────────────────
