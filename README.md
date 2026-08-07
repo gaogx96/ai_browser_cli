@@ -72,9 +72,13 @@ agent-browser-cli prompt
 
 直接将内置的 LLM 系统提示词输出到 stdout，可管道传给 AI 框架。
 
-## Agent 自主规划（新增）
+## Agent 自主规划
 
-给 Agent 一个自然语言任务，它能自主分解为多步浏览器操作并执行。
+Agent 采用 **闭环控制**（ReAct 循环 + 验证 + 恢复），自主完成多步浏览器任务。
+
+```
+观察 → 结构化快照 → LLM 决策 → 执行 → 验证 → 更新状态 → 恢复/重规划 → 循环
+```
 
 ### 通过 MCP 工具
 
@@ -92,22 +96,46 @@ cd /d/agent_browser_cli/ai_browser_cli_repo
 python agent_runner.py "打开 https://example.com 并读取标题"
 ```
 
-### 工作原理
+### 闭环控制能力
 
-Agent 采用 **ReAct 循环**（观察→决策→执行→观察）：
+| 能力 | 说明 |
+|------|------|
+| 结构化动作结果 | 每次动作返回 transport_ok / page_responded / effects 三层语义 |
+| 页面变化验证 | before/after 快照对比（URL、标题、DOM 指纹、表单状态、新标签页） |
+| 目标状态管理 | `current_goal` / `next_goal` / `completed_goals` 滚动式目标分解 |
+| 有限错误恢复 | STALE_TARGET → reobserve；ELEMENT_NOT_FOUND → reobserve；NAVIGATION_TIMEOUT → check URL/retry once |
+| Pause / Resume | 同进程内 checkpoint 暂停/恢复，恢复后重新观察页面 |
+| 上下文模式 | `AGENT_CONTEXT_MODE=legacy|dual|structured` 三模式兼容 |
 
-1. **观察** — 调用 `page_tree` / `meta` 获取当前页面状态
-2. **决策** — 把任务 + 页面树 + 历史发给 LLM，LLM 返回下一步动作
-3. **执行** — 执行 LLM 返回的动作（navigate/click/type/evaluate/download_setup）
-4. **记录** — 动作结果入历史，供下一步参考
-5. **循环** — 直到 LLM 输出 `stop` 或达到最大步数
+### 环境变量
 
-### 支持的 LLM 后端
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `AGENT_CONTEXT_MODE` | `dual` | 上下文模式：`legacy`（旧 history）/ `dual`（双写）/ `structured`（仅结构化） |
+| `AGENT_VERIFY_MODE` | `shadow` | 验证模式：`off` / `shadow`（只记录）/ `active` |
+| `AGENT_RECOVERY_MODE` | `off` | 恢复模式：`off` / `shadow` / `active` |
+| `AGENT_MAX_STEPS` | `15` | 最大步数 |
+| `AGENT_LLM_DELAY` | `0` | LLM 调用间延迟（秒），用于低配额 API |
 
-| 后端 | 环境变量 |
-|------|---------|
-| Anthropic（默认） | `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` |
-| OpenAI | `OPENAI_API_KEY` |
+### 暂停与恢复（Pause / Resume）
+
+Agent 支持三种暂停原因：
+
+- `waiting_for_user` — 验证码、登录授权、人工确认
+- `waiting_for_page` — 页面仍在加载、下载尚未完成
+- `waiting_for_external_event` — 等待邮件、支付回调、第三方状态
+
+**MCP 接口**：
+
+```json
+{"action": "agent_resume", "checkpoint_id": "cp_xxx"}
+```
+
+**限制**（当前版本）：
+- 仅支持**同一进程、同一 MCP 实例**内恢复
+- 进程重启后 checkpoint 和 session 丢失，旧 checkpoint_id 返回 `CHECKPOINT_NOT_FOUND`
+- 不支持跨进程持久化（Redis/SQLite/PostgreSQL 暂未实现）
+- 不支持多调用方权限隔离（单实例本地使用场景）
 
 ### 动作列表
 
@@ -118,13 +146,17 @@ Agent 采用 **ReAct 循环**（观察→决策→执行→观察）：
 | `type` | 输入文本 |
 | `evaluate` | 执行任意 JavaScript（绕过 50 字符截断） |
 | `download_setup` | 设置下载目录 |
+| `pause` | 暂停任务，生成 checkpoint |
 | `stop` | 任务完成或遇到障碍时终止 |
 
 ### 错误恢复
 
-- 同一元素失败 3 次自动加入黑名单，换策略
-- 链接被截断时自动用 `evaluate` 获取完整 URL
-- 遇到验证码/登录墙时自动终止并提示用户
+| 错误类型 | shadow 建议 | active 行为 |
+|---------|------------|------------|
+| `STALE_TARGET` | reobserve | 强制重新观察，回到 LLM 重新决策（不重放旧动作） |
+| `ELEMENT_NOT_FOUND` | reobserve | 强制重新观察，回到 LLM 重新决策 |
+| `NAVIGATION_TIMEOUT` | check URL → retry once | URL 已到达目标则不重试；未变化最多重试一次 |
+| 其他 | 旧逻辑 | 3 次重试 + 黑名单 |
 
 ### 运行要求
 
@@ -246,6 +278,7 @@ agent-browser-cli prompt
 {"action": "configure", "media_enabled": true}
 {"action": "get_prompt"}
 {"action": "run_task", "task": "打开 https://example.com 并读取标题", "max_steps": 15}
+{"action": "agent_resume", "checkpoint_id": "cp_xxx"}
 ```
 
 ### 输出格式

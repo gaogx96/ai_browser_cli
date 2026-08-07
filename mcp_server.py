@@ -22,6 +22,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+# 日志输出到 stderr，避免污染 MCP 的 stdout JSON-RPC 协议
+_log = lambda *a, **kw: print(*a, **kw, file=sys.stderr, flush=True)
+
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
@@ -553,11 +556,33 @@ class AgentBrowserMCPServer:
         self._server = Server("agent-browser")
         self._checkpoint_store = CheckpointStore()
         self._session_registry = SessionRegistry()
+        self._cleanup_task: asyncio.Task | None = None
+
+    async def _cleanup_loop(self) -> None:
+        """后台定期清理任务：每 5 分钟清理过期 checkpoint 和 session。"""
+        try:
+            while True:
+                await asyncio.sleep(300)  # 5 分钟
+                ck_cleaned = await self._checkpoint_store.cleanup_expired()
+                sess_cleaned = await self._session_registry.cleanup_stale()
+                if ck_cleaned or sess_cleaned:
+                    _log(f"[cleanup] removed {ck_cleaned} checkpoints, {sess_cleaned} sessions")
+        except asyncio.CancelledError:
+            pass
 
     async def run(self) -> None:
         self._register_handlers()
-        async with stdio_server() as (read_stream, write_stream):
-            await self._server.run(read_stream, write_stream, self._server.create_initialization_options())
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        try:
+            async with stdio_server() as (read_stream, write_stream):
+                await self._server.run(read_stream, write_stream, self._server.create_initialization_options())
+        finally:
+            if self._cleanup_task and not self._cleanup_task.done():
+                self._cleanup_task.cancel()
+                try:
+                    await self._cleanup_task
+                except asyncio.CancelledError:
+                    pass
 
     def _register_handlers(self) -> None:
         s = self._server
@@ -777,7 +802,15 @@ async def _handle_resume(
             await checkpoint_store.mark_resumed(checkpoint_id)
             return {"action": "agent_resume", "status": "ok", "result": result.to_dict()}
     except Exception as e:
-        await checkpoint_store.expire(checkpoint_id)
+        # resume 失败：标记 checkpoint 为 failed（而非 expired），
+        # 避免永久停留在 resuming 状态
+        if checkpoint_id:
+            try:
+                ck = await checkpoint_store.get(checkpoint_id)
+                if ck and ck.status == CheckpointStatus.RESUMING:
+                    ck.status = CheckpointStatus.FAILED
+            except Exception:
+                pass
         raise RuntimeError(f"Resume failed: {e}")
 
 
