@@ -128,6 +128,7 @@ class PageSnapshot:
     title: str
     dom_fingerprint: str | None  # 可交互元素归一化指纹
     form_state: dict  # 输入框 value（密码脱敏）
+    focused_element: dict | None = None  # 当前焦点元素 {tag, id, name, role, type}
     targets: tuple[TargetInfo, ...] = ()
     snapshot_ok: bool = True  # 快照是否成功（失败时其他字段可能为空）
 
@@ -143,6 +144,7 @@ class ActionEffects:
     title_changed: bool = False
     dom_changed: bool = False
     form_changed: bool = False
+    focus_changed: bool = False
     new_targets: list[TargetInfo] = field(default_factory=list)
     closed_targets: list[TargetInfo] = field(default_factory=list)
 
@@ -153,6 +155,7 @@ class ActionEffects:
                 self.title_changed,
                 self.dom_changed,
                 self.form_changed,
+                self.focus_changed,
                 bool(self.new_targets),
                 bool(self.closed_targets),
             ]
@@ -164,6 +167,7 @@ class ActionEffects:
             "title_changed": self.title_changed,
             "dom_changed": self.dom_changed,
             "form_changed": self.form_changed,
+            "focus_changed": self.focus_changed,
             "new_targets": [t.target_id for t in self.new_targets],
             "closed_targets": [t.target_id for t in self.closed_targets],
         }
@@ -193,7 +197,7 @@ class ActionVerification:
 # 动作类型 → 预期信号（用于判定 expected_effect_seen）
 ACTION_EXPECTED_EFFECTS: dict[str, set[str]] = {
     "navigate": {"url_changed", "title_changed", "dom_changed"},
-    "click": {"url_changed", "dom_changed", "new_targets"},
+    "click": {"url_changed", "dom_changed", "focus_changed", "form_changed", "new_targets"},
     "type": {"form_changed"},
     "evaluate": set(),  # evaluate 结果由动作专属判断，不依赖通用信号
     "download_setup": set(),
@@ -258,6 +262,7 @@ def _diff(before: PageSnapshot | None, after: PageSnapshot | None) -> ActionEffe
     effects.title_changed = (before.title or "") != (after.title or "")
     effects.dom_changed = (before.dom_fingerprint or "") != (after.dom_fingerprint or "")
     effects.form_changed = before.form_state != after.form_state
+    effects.focus_changed = (before.focused_element or {}) != (after.focused_element or {})
 
     before_ids = before.target_ids
     after_ids = after.target_ids
@@ -278,6 +283,7 @@ def _expected_effect_seen(action_type: str, effects: ActionEffects) -> bool:
             "title_changed" in expected and effects.title_changed,
             "dom_changed" in expected and effects.dom_changed,
             "form_changed" in expected and effects.form_changed,
+            "focus_changed" in expected and effects.focus_changed,
             "new_targets" in expected and bool(effects.new_targets),
         )
     )
@@ -405,12 +411,30 @@ class AgentState:
     task: str
     current_goal: str | None = None
     next_goal: str | None = None
+    previous_goal: str | None = None  # 上一目标，用于分析目标跳跃
     goal_status: str = "not_started"  # not_started | in_progress | completed | failed
     completed_goals: list[str] = field(default_factory=list)
     failed_attempts: list[str] = field(default_factory=list)
     last_observation_summary: str = ""
     step: int = 0
     session_id: str = ""  # P8-D：用于事件关联
+    goal_transitions: list[dict] = field(default_factory=list)  # P8-D：目标推进记录
+
+    @staticmethod
+    def _normalize_goal(goal: str | None) -> str:
+        """规范化目标文本，用于比较。"""
+        if not goal:
+            return ""
+        return goal.strip().lower().rstrip("。，.!.")
+
+    @staticmethod
+    def _evaluation_says_completed(eval_text: str | None) -> bool:
+        """判断 LLM 的 evaluation_previous_goal 是否表示目标已完成。"""
+        if not eval_text:
+            return False
+        text = eval_text.strip().lower()
+        completed_keywords = ["已完成", "完成", "completed", "done", "成功", "succeeded"]
+        return any(kw in text for kw in completed_keywords)
 
     # 观察页面并更新最近观察摘要
     def observe(self, tree: str, meta: dict) -> None:
@@ -430,11 +454,54 @@ class AgentState:
 
     # 记录 LLM 提议的下一个目标（runtime 采纳，非直接覆盖）
     def record_goal_proposal(self, decision: "Decision") -> None:
-        if decision.next_goal:
-            self.next_goal = decision.next_goal
-        if self.current_goal is None and self.next_goal:
-            self.current_goal = self.next_goal
+        """根据 LLM 提议推进目标。
+
+        规则：
+        - current_goal 为空 → 直接设置 next_goal
+        - next_goal 与 current_goal 相同 → 不变
+        - LLM 明确表示上一目标已完成 → 晋升 next_goal 为 current_goal
+        - LLM 提出不同 next_goal 但未说明完成 → 暂存，不覆盖
+        """
+        next_goal = decision.next_goal
+        if not next_goal:
+            return
+
+        self.next_goal = next_goal
+        norm_next = self._normalize_goal(next_goal)
+        norm_cur = self._normalize_goal(self.current_goal)
+
+        if self.current_goal is None:
+            self.current_goal = next_goal
             self.goal_status = "in_progress"
+            # 首次设置时，next_goal 与 current_goal 相同，不置空
+            self.goal_transitions.append({
+                "from": None, "to": next_goal,
+                "reason": "initial",
+                "step": self.step,
+            })
+            return
+
+        if norm_next == norm_cur:
+            self.next_goal = next_goal
+            return
+
+        # 检查 LLM 是否表示上一目标已完成
+        eval_text = decision.evaluation_previous_goal
+        if self._evaluation_says_completed(eval_text):
+            # 推进目标
+            self.previous_goal = self.current_goal
+            self.current_goal = next_goal
+            self.next_goal = None
+            self.goal_status = "in_progress"
+            self.goal_transitions.append({
+                "from": self.previous_goal,
+                "to": next_goal,
+                "reason": f"evaluation: {eval_text[:50]}",
+                "step": self.step,
+            })
+        else:
+            # 暂存为 next_goal，不覆盖 current_goal
+            self.next_goal = next_goal
 
     # 记录一次失败尝试（仅明确失败时）
     def record_failure(self, decision: "Decision", error: str) -> None:
@@ -622,6 +689,11 @@ def assess_from_rules(action_type: str, before: PageSnapshot | None, after: Page
             evidence.append(GoalEvidence("element_present", "新标签页已打开", weight=0.9))
         if effects.dom_changed:
             evidence.append(GoalEvidence("element_present", "页面 DOM 已变化", weight=0.5))
+        if effects.focus_changed:
+            # 点击后焦点变化 → 说明点击有效（如聚焦输入框）
+            evidence.append(GoalEvidence("focus_received", "页面焦点已变化", weight=0.85))
+        if effects.form_changed:
+            evidence.append(GoalEvidence("form_state", "表单状态已变化", weight=0.7))
         if evidence:
             status = "completed"
             confidence = min(0.3 + 0.5 * len(evidence), 0.9)
@@ -761,6 +833,12 @@ class AgentRunner:
         # P8-C：GoalAssessment 配置
         self._goal_assessment_mode = os.environ.get("AGENT_GOAL_ASSESSMENT", "off").lower()
         # off | shadow | active — 默认 off，shadow 只记录不干预
+
+        # 循环防护配置（重复 no_effect 动作检测）
+        self._loop_guard_mode = os.environ.get("AGENT_LOOP_GUARD", "off").lower()
+        # off | shadow | active — 默认 off
+        self._no_effect_counts: dict[str, int] = {}  # action_signature → 计数
+        self._last_action_signature: str = ""  # 上一步的动作签名，用于重置
 
         # P8-D：可观测性配置
         self._observability = os.environ.get("AGENT_OBSERVABILITY", "stderr").lower()
@@ -935,7 +1013,19 @@ class AgentRunner:
                             _log(f"  [recover] 重试仍失败，进入旧逻辑")
                         # 无论重试是否成功，继续后续流程（不进 continue）
 
-            # 13. 防死循环：同一元素失败 3 次则强制跳过（旧逻辑 fallback）
+            # 13. 循环防护：重复 no_effect 动作检测（shadow / active）
+            if self._loop_guard_mode != "off":
+                loop_recovery = self._handle_loop_guard(
+                    decision=decision,
+                    verification=verification,
+                    after=after,
+                )
+                if loop_recovery is not None and self._loop_guard_mode == "active":
+                    if loop_recovery.kind == "reobserve":
+                        _log(f"  [loop_guard] 强制重新观察（{loop_recovery.reason}）")
+                        continue
+
+            # 14. 防死循环：同一元素失败 3 次则强制跳过（旧逻辑 fallback）
             target_id = decision.target_id
             if not result.get("success") and target_id:
                 self._retry_counts[target_id] = self._retry_counts.get(target_id, 0) + 1
@@ -1223,6 +1313,91 @@ class AgentRunner:
             f"reason={recovery.reason}"
         )
 
+    # ── 循环防护（重复 no_effect 动作检测） ──────────────────────────────
+
+    def _no_effect_signature(self, decision: Decision, page_fingerprint: str | None) -> str:
+        """生成动作签名，用于检测重复 no_effect 动作。"""
+        return f"{decision.action_type}:{decision.target_id}:{page_fingerprint or ''}"
+
+    def _handle_loop_guard(self, decision: Decision, verification: ActionVerification | None,
+                           after: PageSnapshot | None) -> RecoveryDecision | None:
+        """检测重复 no_effect 动作。如果同一签名连续多次 no_effect，触发恢复。
+
+        策略：
+        - 第 1 次 no_effect → 正常继续
+        - 第 2 次相同 no_effect → reobserve
+        - 第 3 次相同 no_effect → 暂时屏蔽 target
+        - 页面变化 / 动作变化 → 重置计数
+        """
+        if self._loop_guard_mode == "off":
+            return None
+
+        status = verification.status if verification else "unknown"
+        action_type = decision.action_type
+        target_id = decision.target_id
+
+        if status != "no_effect":
+            # 有有效效果，重置计数
+            self._no_effect_counts.clear()
+            self._last_action_signature = ""
+            return None
+
+        # 生成签名
+        fingerprint = after.dom_fingerprint if after else None
+        sig = self._no_effect_signature(decision, fingerprint)
+
+        # 如果签名变化，重置计数
+        if sig != self._last_action_signature and self._last_action_signature:
+            self._no_effect_counts.clear()
+
+        count = self._no_effect_counts.get(sig, 0) + 1
+        self._no_effect_counts[sig] = count
+        self._last_action_signature = sig
+
+        if count == 1:
+            # 第 1 次 no_effect，正常继续
+            return None
+
+        if count == 2:
+            # 第 2 次相同 no_effect → reobserve
+            self._emit_event("loop_guard_decision", {
+                "kind": "no_effect_repeat",
+                "action_type": action_type,
+                "target_id": target_id,
+                "repeat_count": count,
+                "next_strategy": "reobserve",
+                "executed": self._loop_guard_mode == "active",
+            })
+            if self._loop_guard_mode == "active":
+                return RecoveryDecision(
+                    kind="reobserve",
+                    reason=f"no_effect repeat {count}x on {action_type}:{target_id}",
+                    force_reobserve=True,
+                )
+            return None
+
+        if count >= 3:
+            # 第 3 次相同 no_effect → 暂时屏蔽 target
+            self._emit_event("loop_guard_decision", {
+                "kind": "no_effect_repeat",
+                "action_type": action_type,
+                "target_id": target_id,
+                "repeat_count": count,
+                "next_strategy": "block_target",
+                "executed": self._loop_guard_mode == "active",
+            })
+            if self._loop_guard_mode == "active":
+                self.attempted.add(target_id)
+                _log(f"  [loop_guard] 屏蔽 target {target_id}（{count}x no_effect）")
+                return RecoveryDecision(
+                    kind="reobserve",
+                    reason=f"blocked target {target_id} after {count}x no_effect",
+                    force_reobserve=True,
+                )
+            return None
+
+        return None
+
     # ── 阶段 6A：Checkpoint / Pause / Resume ──────────────────────────────
 
     async def _create_checkpoint(
@@ -1382,6 +1557,7 @@ class AgentRunner:
         # 指纹/表单/目标信息各自 best-effort，失败不影响主快照
         fingerprint = await self._dom_fingerprint()
         form_state = await self._form_state()
+        focused = await self._focused_element()
         targets = await self._target_infos()
 
         return PageSnapshot(
@@ -1390,6 +1566,7 @@ class AgentRunner:
             title=title,
             dom_fingerprint=fingerprint,
             form_state=form_state,
+            focused_element=focused,
             targets=targets,
             snapshot_ok=True,
         )
@@ -1470,6 +1647,28 @@ class AgentRunner:
             return val if isinstance(val, dict) else {}
         except Exception:
             return {}
+
+    async def _focused_element(self) -> dict | None:
+        """采集当前页面焦点元素信息。只记录元素身份，不记录 value。"""
+        expr = r"""
+        (() => {
+          const el = document.activeElement;
+          if (!el || el === document.body) return null;
+          return {
+            tag: el.tagName.toLowerCase(),
+            id: el.id || '',
+            name: el.getAttribute('name') || '',
+            role: el.getAttribute('role') || '',
+            type: el.getAttribute('type') || '',
+          };
+        })()
+        """
+        try:
+            resp = await self.browser.send_command("evaluate", expression=expr)
+            val = resp.get("result", {})
+            return val if isinstance(val, dict) and val.get("tag") else None
+        except Exception:
+            return None
 
     async def _target_infos(self) -> tuple[TargetInfo, ...]:
         """采集当前 agent 相关 target 列表。底层不支持时返回空元组。"""
