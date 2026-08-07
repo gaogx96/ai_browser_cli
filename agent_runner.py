@@ -201,30 +201,30 @@ ACTION_SETTLE_TIMEOUT: dict[str, int] = {
 }
 
 
+def _classify_msg(msg: str) -> ErrorKind:
+    """根据错误文本归类错误类型（exc 和 raw_result 共用）。"""
+    if "not found" in msg or "not exist" in msg or "not in any frame" in msg:
+        return ErrorKind.ELEMENT_NOT_FOUND
+    if "stale" in msg or "detached" in msg or "already disposed" in msg or "disposed" in msg:
+        return ErrorKind.STALE_TARGET
+    if "timeout" in msg or "timed out" in msg:
+        return ErrorKind.NAVIGATION_TIMEOUT
+    if "not interactable" in msg or "not clickable" in msg or "covered" in msg:
+        return ErrorKind.ELEMENT_NOT_INTERACTABLE
+    if "permission" in msg or "login" in msg or "captcha" in msg or "风控" in msg:
+        return ErrorKind.PERMISSION_REQUIRED
+    return ErrorKind.UNKNOWN
+
+
 def classify_error(exc: Exception | None, raw_result: dict | None = None) -> ErrorKind:
     """把异常/原始结果统一归类为 ErrorKind。所有 _execute() 错误都经过此入口。"""
     if exc is not None:
-        msg = str(exc).lower()
-        if "not found" in msg or "not exist" in msg or "not in any frame" in msg:
-            return ErrorKind.ELEMENT_NOT_FOUND
-        if "stale" in msg or "detached" in msg or "already disposed" in msg:
-            return ErrorKind.STALE_TARGET
-        if "timeout" in msg or "timed out" in msg:
-            return ErrorKind.NAVIGATION_TIMEOUT
-        if "not interactable" in msg or "not clickable" in msg or "covered" in msg:
-            return ErrorKind.ELEMENT_NOT_INTERACTABLE
-        if "permission" in msg or "login" in msg or "captcha" in msg or "风控" in msg:
-            return ErrorKind.PERMISSION_REQUIRED
-        return ErrorKind.UNKNOWN
+        return _classify_msg(str(exc).lower())
 
     if raw_result:
         err = str(raw_result.get("error", "")).lower()
-        if "not found" in err or "not exist" in err:
-            return ErrorKind.ELEMENT_NOT_FOUND
-        if "stale" in err or "detached" in err:
-            return ErrorKind.STALE_TARGET
-        if "timeout" in err:
-            return ErrorKind.NAVIGATION_TIMEOUT
+        return _classify_msg(err)
+
     return ErrorKind.UNKNOWN
 
 
