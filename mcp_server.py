@@ -14,8 +14,11 @@ Usage:
 import asyncio
 import json
 import os
+import secrets
 import subprocess
 import sys
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -179,6 +182,125 @@ class BrowserSubprocess:
             pass
 
 
+# ── 阶段 6B：CheckpointStore + Session Registry ───────────────────────────
+# 同一进程内恢复。跨进程持久化暂不实现。
+
+
+class CheckpointStatus(str, Enum):
+    PAUSED = "paused"
+    RESUMING = "resuming"
+    RESUMED = "resumed"
+    SUPERSEDED = "superseded"
+    EXPIRED = "expired"
+    FAILED = "failed"
+
+
+@dataclass
+class StoredCheckpoint:
+    """带状态的 checkpoint 记录（内存存储）。"""
+    checkpoint_id: str
+    session_id: str
+    status: CheckpointStatus = CheckpointStatus.PAUSED
+    created_at: float = 0.0
+    data: dict = field(default_factory=dict)  # checkpoint.to_dict()
+
+
+class CheckpointStore:
+    """内存 checkpoint 存储：put / get / consume / expire。"""
+
+    def __init__(self) -> None:
+        self._store: dict[str, StoredCheckpoint] = {}
+
+    async def put(self, checkpoint: Any, session_id: str) -> str:
+        """保存 checkpoint，返回 checkpoint_id。"""
+        ck_id = checkpoint.checkpoint_id or secrets.token_urlsafe(24)
+        import time
+        self._store[ck_id] = StoredCheckpoint(
+            checkpoint_id=ck_id,
+            session_id=session_id,
+            status=CheckpointStatus.PAUSED,
+            created_at=time.time(),
+            data=checkpoint.to_dict(),
+        )
+        return ck_id
+
+    async def get(self, checkpoint_id: str) -> StoredCheckpoint | None:
+        return self._store.get(checkpoint_id)
+
+    async def consume(self, checkpoint_id: str) -> StoredCheckpoint | None:
+        """原子领取：把 checkpoint 从 paused 改为 resuming，防止并发重复恢复。
+
+        只在状态为 PAUSED 时成功领取（返回对象并置为 RESUMING）。
+        否则返回 None（已被领取/已恢复/已过期），调用方据此判断冲突。
+        """
+        ck = self._store.get(checkpoint_id)
+        if ck is None:
+            return None
+        if ck.status != CheckpointStatus.PAUSED:
+            return None  # 非 PAUSED，无法领取
+        ck.status = CheckpointStatus.RESUMING
+        return ck
+
+    async def mark_resumed(self, checkpoint_id: str) -> None:
+        if checkpoint_id in self._store:
+            self._store[checkpoint_id].status = CheckpointStatus.RESUMED
+
+    async def mark_superseded(self, checkpoint_id: str) -> None:
+        if checkpoint_id in self._store:
+            self._store[checkpoint_id].status = CheckpointStatus.SUPERSEDED
+
+    async def expire(self, checkpoint_id: str) -> None:
+        if checkpoint_id in self._store:
+            self._store[checkpoint_id].status = CheckpointStatus.EXPIRED
+
+
+@dataclass
+class AgentSession:
+    """一个活动的 agent 会话（同一进程内复用）。"""
+    session_id: str
+    browser: BrowserSubprocess
+    adapter: "_BrowserSubprocessAdapter"
+    runner: Any
+    checkpoint_id: str | None = None
+
+
+class SessionRegistry:
+    """session_id → AgentSession 映射。恢复时复用原浏览器会话。"""
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, AgentSession] = {}
+
+    def register(self, session: AgentSession) -> None:
+        self._sessions[session.session_id] = session
+
+    def get(self, session_id: str) -> AgentSession | None:
+        return self._sessions.get(session_id)
+
+    def remove(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
+
+    def has(self, session_id: str) -> bool:
+        return session_id in self._sessions
+
+
+# MCP 错误码
+class ResumeErrorCode(str, Enum):
+    CHECKPOINT_NOT_FOUND = "CHECKPOINT_NOT_FOUND"
+    CHECKPOINT_EXPIRED = "CHECKPOINT_EXPIRED"
+    CHECKPOINT_ALREADY_RESUMED = "CHECKPOINT_ALREADY_RESUMED"
+    SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
+    CHECKPOINT_VERSION_UNSUPPORTED = "CHECKPOINT_VERSION_UNSUPPORTED"
+    PAGE_CONTEXT_UNAVAILABLE = "PAGE_CONTEXT_UNAVAILABLE"
+    RESUME_CONFLICT = "RESUME_CONFLICT"
+
+
+class ResumeError(Exception):
+    def __init__(self, code: ResumeErrorCode, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 # ── MCP Server ─────────────────────────────────────────────────────────
 
 # Pre-defined tools
@@ -339,6 +461,24 @@ TOOLS = [
             "required": ["task"],
         },
     ),
+    Tool(
+        name="agent_resume",
+        description="Resume a paused browser task from a checkpoint. The Agent re-observes the current page, matches it against the checkpoint, restores task state, and continues from the LLM decision loop. Does NOT replay old actions. Same-process only: the original browser session must still be alive.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "checkpoint_id": {
+                    "type": "string",
+                    "description": "The checkpoint ID returned by a previous run_task that paused",
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Optional override for max steps during resume",
+                },
+            },
+            "required": ["checkpoint_id"],
+        },
+    ),
 ]
 
 
@@ -348,6 +488,8 @@ class AgentBrowserMCPServer:
     def __init__(self) -> None:
         self._browser = BrowserSubprocess()
         self._server = Server("agent-browser")
+        self._checkpoint_store = CheckpointStore()
+        self._session_registry = SessionRegistry()
 
     async def run(self) -> None:
         self._register_handlers()
@@ -369,7 +511,13 @@ class AgentBrowserMCPServer:
                 await browser.start()
 
             try:
-                result = await dispatch(browser, name, args)
+                result = await dispatch(
+                    browser,
+                    name,
+                    args,
+                    checkpoint_store=self._checkpoint_store,
+                    session_registry=self._session_registry,
+                )
                 # Return as TextContent list (unstructured content)
                 return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
             except RuntimeError as e:
@@ -377,7 +525,13 @@ class AgentBrowserMCPServer:
                 raise RuntimeError(str(e))
 
 
-async def dispatch(browser: BrowserSubprocess, name: str, args: dict[str, Any]) -> dict[str, Any]:
+async def dispatch(
+    browser: BrowserSubprocess,
+    name: str,
+    args: dict[str, Any],
+    checkpoint_store: CheckpointStore | None = None,
+    session_registry: SessionRegistry | None = None,
+) -> dict[str, Any]:
     if name == "navigate":
         url = args.get("url", "")
         if not url:
@@ -449,9 +603,119 @@ async def dispatch(browser: BrowserSubprocess, name: str, args: dict[str, Any]) 
         llm = LLMClient(provider=llm_provider)
         runner = AgentRunner(browser=adapter, llm=llm, max_steps=max_steps)
         result = await runner.run(task)
+
+        # 如果暂停，保存 checkpoint 和 session
+        if result.status == "paused" and result.checkpoint and checkpoint_store and session_registry:
+            session_id = result.checkpoint.session_id or secrets.token_urlsafe(24)
+            ck_id = await checkpoint_store.put(result.checkpoint, session_id)
+            session_registry.register(AgentSession(
+                session_id=session_id,
+                browser=browser,
+                adapter=adapter,
+                runner=runner,
+                checkpoint_id=ck_id,
+            ))
+            result_dict = result.to_dict()
+            result_dict["checkpoint"]["checkpoint_id"] = ck_id
+            result_dict["session_id"] = session_id
+            return {"action": "run_task", "status": "ok", "result": result_dict}
+
         return {"action": "run_task", "status": "ok", "result": result.to_dict()}
 
+    if name == "agent_resume":
+        if not checkpoint_store or not session_registry:
+            raise RuntimeError("Checkpoint store or session registry not available")
+        return await _handle_resume(browser, args, checkpoint_store, session_registry)
+
     raise RuntimeError(f"Unknown tool: {name}")
+
+
+async def _handle_resume(
+    browser: BrowserSubprocess,
+    args: dict[str, Any],
+    checkpoint_store: CheckpointStore,
+    session_registry: SessionRegistry,
+) -> dict[str, Any]:
+    """处理 agent_resume 请求。同一进程内恢复，复用原浏览器 session。"""
+    checkpoint_id = args.get("checkpoint_id", "")
+    if not checkpoint_id:
+        raise ResumeError(ResumeErrorCode.CHECKPOINT_NOT_FOUND, "Missing checkpoint_id")
+
+    # 1. 读取 checkpoint
+    stored = await checkpoint_store.get(checkpoint_id)
+    if stored is None:
+        raise ResumeError(ResumeErrorCode.CHECKPOINT_NOT_FOUND, f"Checkpoint {checkpoint_id} not found")
+
+    if stored.status == CheckpointStatus.EXPIRED:
+        raise ResumeError(ResumeErrorCode.CHECKPOINT_EXPIRED, f"Checkpoint {checkpoint_id} has expired")
+    if stored.status == CheckpointStatus.RESUMED:
+        raise ResumeError(ResumeErrorCode.CHECKPOINT_ALREADY_RESUMED, f"Checkpoint {checkpoint_id} already resumed")
+    if stored.status == CheckpointStatus.RESUMING:
+        raise ResumeError(ResumeErrorCode.RESUME_CONFLICT, f"Checkpoint {checkpoint_id} is being resumed by another request")
+
+    # 2. 查找 session
+    session = session_registry.get(stored.session_id)
+    if session is None:
+        raise ResumeError(ResumeErrorCode.SESSION_NOT_FOUND, f"Session {stored.session_id} no longer exists")
+
+    # 3. 原子领取 checkpoint（防止并发）
+    claimed = await checkpoint_store.consume(checkpoint_id)
+    if claimed is None:
+        # 检查原因：不存在 / 已领取 / 已过期
+        stored2 = await checkpoint_store.get(checkpoint_id)
+        if stored2 is None:
+            raise ResumeError(ResumeErrorCode.CHECKPOINT_NOT_FOUND, f"Checkpoint {checkpoint_id} not found")
+        if stored2.status == CheckpointStatus.EXPIRED:
+            raise ResumeError(ResumeErrorCode.CHECKPOINT_EXPIRED, f"Checkpoint {checkpoint_id} has expired")
+        if stored2.status in (CheckpointStatus.RESUMED, CheckpointStatus.RESUMING):
+            raise ResumeError(ResumeErrorCode.RESUME_CONFLICT, f"Checkpoint {checkpoint_id} already claimed by another request")
+        raise ResumeError(ResumeErrorCode.RESUME_CONFLICT, f"Checkpoint {checkpoint_id} unavailable (status={stored2.status})")
+
+    # 4. 从 checkpoint 数据重建 Checkpoint 对象
+    from agent_runner import Checkpoint as AgentCheckpoint
+    ck_data = stored.data
+    checkpoint = AgentCheckpoint(
+        version=ck_data.get("version", 1),
+        checkpoint_id=checkpoint_id,
+        session_id=stored.session_id,
+        task=ck_data.get("task", ""),
+        current_goal=ck_data.get("current_goal"),
+        next_goal=ck_data.get("next_goal"),
+        completed_goals=ck_data.get("completed_goals", []),
+        failed_attempts=ck_data.get("failed_attempts", []),
+        step=ck_data.get("step", 0),
+        page_url=ck_data.get("page_url", ""),
+        page_fingerprint=ck_data.get("page_fingerprint"),
+        pause_reason=ck_data.get("pause_reason", "waiting_for_user"),
+        snapshot_available=ck_data.get("snapshot_available", True),
+    )
+
+    # 5. 恢复执行
+    try:
+        result = await session.runner.resume(checkpoint)
+        # 标记 checkpoint 已恢复
+        if result.status == "paused" and result.checkpoint:
+            await checkpoint_store.mark_resumed(checkpoint_id)
+            await checkpoint_store.mark_superseded(checkpoint_id)
+            # 新 pause 创建新 checkpoint
+            new_ck_id = await checkpoint_store.put(result.checkpoint, stored.session_id)
+            session_registry.register(AgentSession(
+                session_id=stored.session_id,
+                browser=browser,
+                adapter=session.adapter,
+                runner=session.runner,
+                checkpoint_id=new_ck_id,
+            ))
+            result_dict = result.to_dict()
+            result_dict["checkpoint"]["checkpoint_id"] = new_ck_id
+            result_dict["session_id"] = stored.session_id
+            return {"action": "agent_resume", "status": "ok", "result": result_dict}
+        else:
+            await checkpoint_store.mark_resumed(checkpoint_id)
+            return {"action": "agent_resume", "status": "ok", "result": result.to_dict()}
+    except Exception as e:
+        await checkpoint_store.expire(checkpoint_id)
+        raise RuntimeError(f"Resume failed: {e}")
 
 
 # ── BrowserSubprocess 适配器 ──────────────────────────────────────────────
