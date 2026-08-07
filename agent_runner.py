@@ -466,6 +466,20 @@ class AgentState:
         return "\n".join(lines)
 
 
+# ── 阶段 5：恢复决策 ──────────────────────────────────────────────────────
+# 注意：reobserve 后不自动重放旧动作，回到 LLM 重新决策。
+# 只有 NAVIGATION_TIMEOUT + URL 未变化时允许有限重试一次。
+
+
+@dataclass
+class RecoveryDecision:
+    kind: str  # none | reobserve | retry | abort
+    reason: str
+    retry_action: bool = False
+    force_reobserve: bool = False
+    max_attempts: int = 0
+
+
 # ── Agent Runner ───────────────────────────────────────────────────────────
 
 
@@ -499,6 +513,11 @@ class AgentRunner:
 
         # LLM 调用间延迟（秒），用于适应 API rpm 限制。0 = 不延迟
         self._llm_delay = float(os.environ.get("AGENT_LLM_DELAY", "0"))
+
+        # 阶段 5：恢复层配置
+        self._recovery_mode = os.environ.get("AGENT_RECOVERY_MODE", "off").lower()
+        # off | shadow | active — 默认 off 保留旧逻辑
+        self._recovery_retry_counts: dict[str, int] = {}  # 按 action_id 计数，非全局
 
     async def run(self, task: str) -> AgentResult:
         """执行一个自然语言浏览器任务。"""
@@ -574,6 +593,9 @@ class AgentRunner:
                     effects=effects,
                 )
                 self._log_verification(verification, effects)
+            else:
+                after = None
+                verification = None
 
             # 10. 记录（legacy history 双写）
             history_entry = {
@@ -593,7 +615,48 @@ class AgentRunner:
             else:
                 _log(f"  执行失败: {result.get('error', '')}")
 
-            # 12. 防死循环：同一元素失败 3 次则强制跳过
+            # 12. 阶段 5：错误恢复（shadow / active）
+            # 检查 transport 层和业务层的错误
+            _result_success = result.get("success", False)
+            if _result_success:
+                _data = result.get("data", {})
+                if isinstance(_data, dict) and not _data.get("success", True):
+                    _result_success = False
+            if not _result_success and self._recovery_mode != "off":
+                recovery = self._recover(
+                    decision=decision,
+                    result=result,
+                    verification=verification,
+                    after=after,
+                )
+                self._log_recovery(recovery, decision, result)
+
+                if self._recovery_mode == "active" and recovery.kind != "none":
+                    if recovery.kind == "reobserve":
+                        # 强制重新观察，不重放旧动作。回到 LLM 重新决策
+                        _log(f"  [recover] 强制重新观察，回到 LLM 重新决策")
+                        continue
+
+                    if recovery.kind == "retry" and recovery.retry_action:
+                        _log(f"  [recover] 重试: {recovery.reason}")
+                        # 重新执行相同动作（仅 NAVIGATION_TIMEOUT 且 URL 未变化时）
+                        retry_result = await self._execute(decision.to_action_dict())
+                        retry_success = retry_result.get("success", False)
+                        if retry_success:
+                            _log(f"  [recover] 重试成功")
+                            # 把重试结果写入 history
+                            self.history[-1] = {
+                                "step": step,
+                                "action": decision.to_action_dict(),
+                                "success": True,
+                                "error": "",
+                            }
+                            result = retry_result
+                        else:
+                            _log(f"  [recover] 重试仍失败，进入旧逻辑")
+                        # 无论重试是否成功，继续后续流程（不进 continue）
+
+            # 13. 防死循环：同一元素失败 3 次则强制跳过（旧逻辑 fallback）
             target_id = decision.target_id
             if not result.get("success") and target_id:
                 self._retry_counts[target_id] = self._retry_counts.get(target_id, 0) + 1
@@ -601,7 +664,7 @@ class AgentRunner:
                     self.attempted.add(target_id)
                     _log(f"  元素 {target_id} 已失败 3 次，加入黑名单")
 
-            # 13. 等待页面稳定
+            # 14. 等待页面稳定
             await asyncio.sleep(0.5)
 
         return AgentResult(
@@ -634,6 +697,110 @@ class AgentRunner:
             f"responded={verification.page_responded} "
             f"expected={verification.expected_effect_seen} "
             f"effects={effects.to_dict()}"
+        )
+
+    # ── 阶段 5：错误恢复 ─────────────────────────────────────────────────
+
+    def _recover(
+        self,
+        decision: Decision,
+        result: dict,
+        verification: ActionVerification | None,
+        after: PageSnapshot | None,
+    ) -> RecoveryDecision:
+        """根据错误类型生成恢复决策。
+
+        只处理三类错误：
+          STALE_TARGET → reobserve（不重放旧动作）
+          ELEMENT_NOT_FOUND → reobserve（不重放旧动作）
+          NAVIGATION_TIMEOUT → check URL / retry once
+        其他错误 → none（保留旧逻辑 fallback）
+
+        result 来自 _execute()，其 success 表示 transport 层是否成功。
+        某些动作（如 navigate）即使 transport 成功也可能返回业务错误，
+        需要检查 result 中的 data 字段。
+        """
+        action_type = decision.action_type
+
+        # 检查 transport 层和业务层的错误
+        if not result.get("success", False):
+            # transport 层失败
+            error_msg = str(result.get("error", ""))
+            error_kind = classify_error(None, {"error": error_msg})
+        else:
+            # transport 成功，检查 data 中是否有业务错误
+            data = result.get("data", {})
+            if isinstance(data, dict) and not data.get("success", True):
+                error_msg = str(data.get("error", ""))
+                error_kind = classify_error(None, {"error": error_msg})
+            else:
+                return RecoveryDecision(kind="none", reason="动作成功，无需恢复")
+
+        # STALE_TARGET → 强制重新观察，不重放旧动作
+        if error_kind == ErrorKind.STALE_TARGET:
+            return RecoveryDecision(
+                kind="reobserve",
+                reason=f"stale target {decision.target_id}",
+                force_reobserve=True,
+            )
+
+        # ELEMENT_NOT_FOUND → 强制重新观察
+        if error_kind == ErrorKind.ELEMENT_NOT_FOUND:
+            return RecoveryDecision(
+                kind="reobserve",
+                reason=f"element {decision.target_id} not found",
+                force_reobserve=True,
+            )
+
+        # NAVIGATION_TIMEOUT → 检查 URL 是否已变化
+        if error_kind == ErrorKind.NAVIGATION_TIMEOUT:
+            # 判断 URL 是否已到达目标或已变化（非 about:blank）
+            target_url = decision.url or ""
+            after_url = after.url if after and after.snapshot_ok else ""
+            url_reached = bool(after_url) and (after_url == target_url or (
+                after_url != "about:blank" and after_url != target_url
+            ))
+            if url_reached:
+                # URL 已变化，视为可能成功，继续
+                return RecoveryDecision(
+                    kind="none",
+                    reason="navigation timeout but URL changed, proceeding",
+                )
+            # URL 未变化：检查重试次数
+            action_id = f"navigate:{decision.url}"
+            retries = self._recovery_retry_counts.get(action_id, 0)
+            if retries < 1:
+                self._recovery_retry_counts[action_id] = retries + 1
+                return RecoveryDecision(
+                    kind="retry",
+                    reason="navigation timeout and URL unchanged, retry once",
+                    retry_action=True,
+                    max_attempts=1,
+                )
+            return RecoveryDecision(
+                kind="none",
+                reason="navigation timeout and retry exhausted, fallback to legacy",
+            )
+
+        # 其他错误 → 保留旧逻辑
+        return RecoveryDecision(kind="none", reason=f"unhandled error: {error_kind.value}")
+
+    def _log_recovery(self, recovery: RecoveryDecision, decision: Decision, result: dict) -> None:
+        """记录恢复决策到 stderr。不输出敏感信息。"""
+        action_type = decision.action_type
+        target_id = decision.target_id
+        data = result.get("data", {})
+        if isinstance(data, dict) and not data.get("success", True):
+            error = str(data.get("error", ""))[:60]
+        else:
+            error = str(result.get("error", ""))[:60]
+        _log(
+            f"  [recover] mode={self._recovery_mode} "
+            f"kind={recovery.kind} "
+            f"action={action_type} "
+            f"target={target_id} "
+            f"error={error} "
+            f"reason={recovery.reason}"
         )
 
     async def _observe(self) -> tuple[str, dict]:
