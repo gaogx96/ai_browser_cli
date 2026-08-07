@@ -497,6 +497,9 @@ class AgentRunner:
         # legacy | dual | structured — 默认 dual 双写，legacy 保留旧行为
         self.state: AgentState | None = None  # 由 run() 初始化
 
+        # LLM 调用间延迟（秒），用于适应 API rpm 限制。0 = 不延迟
+        self._llm_delay = float(os.environ.get("AGENT_LLM_DELAY", "0"))
+
     async def run(self, task: str) -> AgentResult:
         """执行一个自然语言浏览器任务。"""
         self.history = []
@@ -514,7 +517,10 @@ class AgentRunner:
             # 2. 阶段 4：更新 AgentState 观察
             self.state.observe(tree, meta)
 
-            # 3. 决策
+            # 3. 决策（前：适应 API rpm 限制的延迟）
+            if self._llm_delay > 0 and step > 1:
+                _log(f"  等待 {self._llm_delay}s 适应 API 限流...")
+                await asyncio.sleep(self._llm_delay)
             if self._context_mode == "legacy":
                 # 旧模式：直接用 history 列表
                 action = await self.llm.decide(task, tree, meta, self.history)
