@@ -109,7 +109,8 @@ async def main():
     print(f"失败: {sum(1 for r in results if not r['success'])}")
     if results:
         print(f"平均步数: {sum(r['steps'] for r in results) / len(results):.1f}")
-    print(f"\n分析 JSONL: python -c \"import json; [print(json.dumps({k: v for k, v in json.loads(l).items() if k in ('event','status','source','confidence','applied','rejected_reason')})) for l in open('{JSONL_PATH}') if l.strip()]\"")
+    print(f"\nJSONL 文件: {os.path.abspath(JSONL_PATH)}")
+    print("分析命令: python -c \"import json; [print(json.dumps({k: e[k] for k in ('event','status','source','confidence','applied','rejected_reason') if k in e}, ensure_ascii=False)) for e in [json.loads(l) for l in open('shadow_data.jsonl') if l.strip()]]\"")
 
 
 if __name__ == "__main__":
