@@ -1588,6 +1588,22 @@ class AgentRunner:
             snapshot_ok=True,
         )
 
+    async def _evaluate_parse(self, expression: str) -> Any:
+        """执行 evaluate 并解析返回值为 Python 对象。
+
+        browser.send_command('evaluate') 返回的 result 字段是 JSON 字符串，
+        需要统一用 json.loads 解析，而不是直接当作 dict 使用。
+        """
+        try:
+            resp = await self.browser.send_command("evaluate", expression=expression)
+            raw = resp.get("result", "")
+            if isinstance(raw, str):
+                import json as _json
+                return _json.loads(raw)
+            return raw
+        except Exception:
+            return None
+
     async def _dom_fingerprint(self) -> str | None:
         """生成可交互元素归一化指纹（role/aria-label/name/type/href/截断文本）。
 
@@ -1615,13 +1631,11 @@ class AgentRunner:
         })()
         """
         try:
-            resp = await self.browser.send_command("evaluate", expression=expr)
-        except Exception:
-            return None
-        try:
-            val = resp.get("result", "")
+            val = await self._evaluate_parse(expr)
+            if isinstance(val, str):
+                return val if val else None
             if isinstance(val, (list, dict)):
-                val = json.dumps(val, ensure_ascii=False)
+                return json.dumps(val, ensure_ascii=False)
             return str(val) if val else None
         except Exception:
             return None
@@ -1656,11 +1670,7 @@ class AgentRunner:
         })()
         """
         try:
-            resp = await self.browser.send_command("evaluate", expression=expr)
-        except Exception:
-            return {}
-        try:
-            val = resp.get("result", {})
+            val = await self._evaluate_parse(expr)
             return val if isinstance(val, dict) else {}
         except Exception:
             return {}
@@ -1681,8 +1691,7 @@ class AgentRunner:
         })()
         """
         try:
-            resp = await self.browser.send_command("evaluate", expression=expr)
-            val = resp.get("result", {})
+            val = await self._evaluate_parse(expr)
             return val if isinstance(val, dict) and val.get("tag") else None
         except Exception:
             return None
