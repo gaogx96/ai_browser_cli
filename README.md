@@ -19,6 +19,8 @@ AI Agent 专属浏览器 CLI — 通过 CDP 协议操控真实 Chrome，为 LLM 
 - **文件下载** — 端口模式用 CDP 下载管理，扩展模式用 `chrome.downloads` API
 - **Windows Job Object** — 进程异常退出时 Chrome 自动被内核级机制终止
 - **内置 Agent Prompt** — `prompt` 子命令直接输出 LLM 系统提示词
+- **Agent 自主规划** — `run_task` 让 Agent 自主观察→决策→执行→观察，完成多步浏览器任务
+- **不抢标签页** — 扩展模式 `active: false` 后台创建标签页，兜底恢复焦点，全程无感
 
 ## 快速开始
 
@@ -70,6 +72,87 @@ agent-browser-cli prompt
 
 直接将内置的 LLM 系统提示词输出到 stdout，可管道传给 AI 框架。
 
+## Agent 自主规划（新增）
+
+给 Agent 一个自然语言任务，它能自主分解为多步浏览器操作并执行。
+
+### 通过 MCP 工具
+
+```python
+# 在 Claude Code 或其他 MCP 客户端中调用
+run_task("打开 https://example.com 并告诉我页面标题")
+run_task("在百度搜索 Rust 并点击第一条结果")
+run_task("下载这个钉钉文档到桌面")
+```
+
+### 通过 Python 独立运行
+
+```bash
+cd /d/agent_browser_cli/ai_browser_cli_repo
+python agent_runner.py "打开 https://example.com 并读取标题"
+```
+
+### 工作原理
+
+Agent 采用 **ReAct 循环**（观察→决策→执行→观察）：
+
+1. **观察** — 调用 `page_tree` / `meta` 获取当前页面状态
+2. **决策** — 把任务 + 页面树 + 历史发给 LLM，LLM 返回下一步动作
+3. **执行** — 执行 LLM 返回的动作（navigate/click/type/evaluate/download_setup）
+4. **记录** — 动作结果入历史，供下一步参考
+5. **循环** — 直到 LLM 输出 `stop` 或达到最大步数
+
+### 支持的 LLM 后端
+
+| 后端 | 环境变量 |
+|------|---------|
+| Anthropic（默认） | `ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` |
+| OpenAI | `OPENAI_API_KEY` |
+
+### 动作列表
+
+| 动作 | 说明 |
+|------|------|
+| `navigate` | 打开 URL |
+| `click` | 点击元素（`target_id`） |
+| `type` | 输入文本 |
+| `evaluate` | 执行任意 JavaScript（绕过 50 字符截断） |
+| `download_setup` | 设置下载目录 |
+| `stop` | 任务完成或遇到障碍时终止 |
+
+### 错误恢复
+
+- 同一元素失败 3 次自动加入黑名单，换策略
+- 链接被截断时自动用 `evaluate` 获取完整 URL
+- 遇到验证码/登录墙时自动终止并提示用户
+
+### 运行要求
+
+```bash
+# 环境变量
+export AGENT_BROWSER_EXTENSION=1  # 必须
+export LLM_PROVIDER=anthropic      # 或 openai
+export ANTHROPIC_API_KEY=sk-xxx   # 你的 API key
+export AGENT_MAX_STEPS=15          # 可选，默认 15 步
+```
+
+## 不抢标签页（新增）
+
+Agent 全程在后台运行，不影响用户当前浏览：
+
+### 三层防护
+
+1. **扩展端 `active: false`** — 所有新标签页在后台创建，不抢焦点
+2. **Rust 侧兜底恢复** — connect 后若标签页意外抢到焦点，立即恢复原活动页
+3. **`detect_new_tab` 不激活** — 发现新标签页只更新内部引用，不激活
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `AGENT_BROWSER_BACKGROUND` | `1` | 后台创建标签页 |
+| `AGENT_BROWSER_RESTORE_FOCUS` | `1` | 启用兜底恢复焦点（设为 `0` 禁用） |
+
 ## 扩展模式
 
 通过 Chrome 扩展 + `chrome.debugger` API 操控浏览器，无需 `--remote-debugging-port`。
@@ -101,6 +184,9 @@ agent-browser-cli prompt
 | 文件下载 | ✅ | ✅（通过 `chrome.downloads` API） |
 | 截图 | ✅ | 仅前台 tab 可用，后台 tab 受 `chrome.debugger` 限制 |
 | 退出安全 | ✅ | ✅ 不关用户 tab，不 kill 浏览器 |
+| evaluate（任意 JS） | ✅ | ✅ |
+| Agent 自主规划（run_task） | ✅ | ✅ |
+| 后台运行不抢焦点 | ✅ | ✅ |
 
 ### 扩展模式截图限制
 
@@ -156,8 +242,10 @@ agent-browser-cli prompt
 {"action": "assert_element", "target_id": "e5", "expected": "登录成功"}
 {"action": "download_setup", "path": "downloads"}
 {"action": "download", "target_id": "e10", "path": "downloads", "timeout": 30000}
+{"action": "evaluate", "expression": "document.title"}
 {"action": "configure", "media_enabled": true}
 {"action": "get_prompt"}
+{"action": "run_task", "task": "打开 https://example.com 并读取标题", "max_steps": 15}
 ```
 
 ### 输出格式
