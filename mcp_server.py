@@ -56,12 +56,24 @@ class BrowserSubprocess:
                 f"Run: cd {PROJECT_ROOT} && cargo build --release"
             )
 
-        cmd = [self._binary, "listen", "--resources", "block"]
+        cmd = [self._binary, "listen"]
 
-        # 支持通过环境变量连接已有 Chrome 实例
+        # 资源策略：可通过环境变量 AGENT_BROWSER_RESOURCES 配置
+        # block=阻断所有(最快), allow=允许所有, smart=只阻断广告
+        resources = os.environ.get("AGENT_BROWSER_RESOURCES", "smart")
+        if resources in ("block", "allow", "smart"):
+            cmd.extend(["--resources", resources])
+
+        # 扩展模式（推荐）：通过 Chrome 扩展 + chrome.debugger API 连接，无需 --remote-debugging-port
+        # 用法: env AGENT_BROWSER_EXTENSION=1
+        use_extension = os.environ.get("AGENT_BROWSER_EXTENSION", "")
+        if use_extension and use_extension.lower() in ("1", "true", "yes"):
+            cmd.append("--extension")
+
+        # 支持通过环境变量连接已有 Chrome 实例（需 --remote-debugging-port）
         # 用法: env AGENT_BROWSER_CONNECT=http://127.0.0.1:9222
         connect_url = os.environ.get("AGENT_BROWSER_CONNECT", "")
-        if connect_url:
+        if connect_url and not use_extension:
             cmd.extend(["--connect", connect_url])
 
         profile = os.environ.get("AGENT_BROWSER_PROFILE", "")
@@ -249,6 +261,84 @@ TOOLS = [
             "properties": {},
         },
     ),
+    Tool(
+        name="configure",
+        description="Configure runtime settings. Set media_enabled=true to allow all resources (images, CSS, fonts) to load. Useful for SPAs that need full rendering.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "media_enabled": {
+                    "type": "boolean",
+                    "description": "Set to true to enable media resources, false to re-enable blocking",
+                }
+            },
+            "required": ["media_enabled"],
+        },
+    ),
+    Tool(
+        name="evaluate",
+        description="Execute arbitrary JavaScript on the current page and return the result. Bypasses the 50-char truncation of extract_tree.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "JavaScript expression to evaluate on the page",
+                }
+            },
+            "required": ["expression"],
+        },
+    ),
+    Tool(
+        name="download_setup",
+        description="Set up download directory. Browser will intercept downloads and save files to this path.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path to save downloaded files",
+                }
+            },
+            "required": ["path"],
+        },
+    ),
+    Tool(
+        name="download",
+        description="Click a download link and save the file. The download_setup must be called first.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "target_id": {
+                    "type": "string",
+                    "description": "Element ID of the download link",
+                }
+            },
+            "required": ["target_id"],
+        },
+    ),
+    Tool(
+        name="run_task",
+        description="Execute a natural-language browser task. The Agent autonomously plans and executes multi-step operations (observe page tree -> decide next action via LLM -> execute -> observe) until the task is complete.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The browser task to complete, described in natural language",
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Maximum reasoning/action steps (default 15)",
+                },
+                "llm_provider": {
+                    "type": "string",
+                    "description": "LLM provider: 'anthropic' or 'openai' (default: read LLM_PROVIDER env, else anthropic)",
+                },
+            },
+            "required": ["task"],
+        },
+    ),
 ]
 
 
@@ -319,7 +409,83 @@ async def dispatch(browser: BrowserSubprocess, name: str, args: dict[str, Any]) 
     if name == "get_prompt":
         return await browser.send_command("get_prompt")
 
+    if name == "configure":
+        media_enabled = args.get("media_enabled", False)
+        return await browser.send_command("configure", media_enabled=media_enabled)
+
+    if name == "evaluate":
+        expression = args.get("expression", "")
+        if not expression:
+            raise RuntimeError("Missing required argument: 'expression'")
+        return await browser.send_command("evaluate", expression=expression)
+
+    if name == "get_content":
+        return await browser.send_command("get_content")
+
+    if name == "download_setup":
+        path = args.get("path", "")
+        if not path:
+            raise RuntimeError("Missing required argument: 'path'")
+        return await browser.send_command("download_setup", path=path)
+
+    if name == "download":
+        target_id = args.get("target_id", "")
+        if not target_id:
+            raise RuntimeError("Missing required argument: 'target_id'")
+        return await browser.send_command("download", target_id=target_id)
+
+    if name == "run_task":
+        task = args.get("task", "")
+        if not task:
+            raise RuntimeError("Missing required argument: 'task'")
+        max_steps = args.get("max_steps", 15)
+        llm_provider = args.get("llm_provider", "") or os.environ.get("LLM_PROVIDER", "anthropic")
+
+        # 创建适配器，让 BrowserSubprocess 适配 BrowserClient 接口
+        adapter = _BrowserSubprocessAdapter(browser)
+        from llm import LLMClient
+        from agent_runner import AgentRunner
+
+        llm = LLMClient(provider=llm_provider)
+        runner = AgentRunner(browser=adapter, llm=llm, max_steps=max_steps)
+        result = await runner.run(task)
+        return {"action": "run_task", "status": "ok", "result": result.to_dict()}
+
     raise RuntimeError(f"Unknown tool: {name}")
+
+
+# ── BrowserSubprocess 适配器 ──────────────────────────────────────────────
+
+
+class _BrowserSubprocessAdapter:
+    """将 BrowserSubprocess（send_command）适配为 agent_runner 所需的 BrowserClient 接口。
+
+    agent_runner 调用 browser.meta(), browser.tree(), browser.navigate() 等方法，
+    这个适配器把它们映射到 BrowserSubprocess.send_command()。
+    """
+
+    def __init__(self, browser: BrowserSubprocess) -> None:
+        self._browser = browser
+
+    async def meta(self) -> dict[str, Any]:
+        resp = await self._browser.send_command("meta")
+        return resp.get("meta", {})
+
+    async def tree(self) -> str:
+        resp = await self._browser.send_command("tree")
+        return resp.get("tree", "[No interactive elements found]")
+
+    async def navigate(self, url: str, **kw: Any) -> dict[str, Any]:
+        return await self._browser.send_command("navigate", url=url)
+
+    async def click(self, target_id: str, **kw: Any) -> dict[str, Any]:
+        return await self._browser.send_command("click", target_id=target_id)
+
+    async def type_text(self, target_id: str, text: str, **kw: Any) -> dict[str, Any]:
+        return await self._browser.send_command("type", target_id=target_id, text=text)
+
+    async def send_command(self, action: str, **kwargs: Any) -> dict[str, Any]:
+        return await self._browser.send_command(action, **kwargs)
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────

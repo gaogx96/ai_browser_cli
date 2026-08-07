@@ -161,7 +161,8 @@ async function handleGetTargets(cmdId) {
 
 async function handleCreateTab(msg, cmdId) {
   const url = msg.url ?? "about:blank";
-  const tab = await chrome.tabs.create({ url });
+  // active: false — 不激活新标签页，避免抢用户焦点
+  const tab = await chrome.tabs.create({ url, active: false });
   reply(cmdId, { ok: true, data: { tabId: tab.id } });
 }
 

@@ -532,6 +532,17 @@ async fn cmd_listen_extension(resources: &str) -> i32 {
     router.set_facade_tx(facade.facade_tx.clone()).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
+    // 兜底恢复焦点：connect 前记录原活动标签页（通过扩展查询）
+    let original_tab_id: Option<i64> = {
+        match bridge.send_to_extension(json!({"op": "getActiveTab"})).await {
+            Ok(v) => v.get("tabId").and_then(|x| x.as_i64()),
+            Err(_) => None,
+        }
+    };
+    if let Some(tid) = original_tab_id {
+        eprintln!("[tabs] Original active tab: {}", tid);
+    }
+
     let bs = match BrowserState::connect("ws://127.0.0.1:9224/devtools/browser/agent").await {
         Ok(bs) => bs,
         Err(e) => {
@@ -539,6 +550,44 @@ async fn cmd_listen_extension(resources: &str) -> i32 {
             return 1;
         }
     };
+
+    // 兜底：connect 后如果 agent 标签页意外抢到焦点，且原标签页仍存在，则恢复原标签页
+    // 环境变量 AGENT_BROWSER_RESTORE_FOCUS=0 可禁用此行为
+    if std::env::var("AGENT_BROWSER_RESTORE_FOCUS").as_deref() != Ok("0") {
+        if let Some(orig_id) = original_tab_id {
+            // 查询当前活动标签页
+            let current_active: Option<i64> = bridge
+                .send_to_extension(json!({"op": "getActiveTab"}))
+                .await
+                .ok()
+                .and_then(|v| v.get("tabId").and_then(|x| x.as_i64()));
+
+            // 仅当"当前活动页是 agent 页（即与原始活动页不同）"时才检查原页是否存在
+            if current_active.is_some() && current_active != Some(orig_id) {
+                // 查询原标签页是否仍存在（通过 chrome.debugger.getTargets 的 tabId 字段判断）
+                let orig_exists: bool = bridge
+                    .send_to_extension(json!({"op": "getTargets"}))
+                    .await
+                    .map(|targets| {
+                        targets
+                            .get("targets")
+                            .and_then(|t| t.as_array())
+                            .map(|arr| {
+                                arr.iter().any(|t| t.get("tabId").and_then(|x| x.as_i64()) == Some(orig_id))
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+
+                if orig_exists {
+                    eprintln!("[tabs] Agent tab stole focus, restoring original tab {}", orig_id);
+                    let _ = bridge
+                        .send_to_extension(json!({"op": "activateTab", "tabId": orig_id}))
+                        .await;
+                }
+            }
+        }
+    }
 
     // Apply resource strategy
     match resources {
@@ -1188,6 +1237,7 @@ async fn process_command(
         "tree" => handle_tree(bs).await,
         "meta" => handle_meta(bs).await,
         "get_content" => handle_get_content(bs).await,
+        "evaluate" => handle_evaluate(bs, &cmd).await,
         "wait_for" => handle_wait_for(bs, &cmd).await,
         "assert_element" => handle_assert_element(bs, &cmd).await,
         "download_setup" => handle_download_setup(bs, &cmd).await,
@@ -1324,6 +1374,24 @@ async fn handle_get_content(bs: &BrowserState) -> Result<serde_json::Value> {
         "status": "ok",
         "action": "get_content",
         "content": content,
+    }))
+}
+
+async fn handle_evaluate(
+    bs: &BrowserState,
+    cmd: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let expression = cmd
+        .get("expression")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing 'expression' field for evaluate"))?;
+
+    let result = bs.evaluate(expression).await?;
+
+    Ok(json!({
+        "status": "ok",
+        "action": "evaluate",
+        "result": result,
     }))
 }
 

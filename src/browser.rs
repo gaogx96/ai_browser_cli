@@ -1614,6 +1614,23 @@ impl BrowserState {
         Ok(value)
     }
 
+    /// Evaluate arbitrary JavaScript on the current page and return the result as a string.
+    /// This bypasses the 50-char truncation of extract_tree for links and other elements.
+    pub async fn evaluate(&self, expression: &str) -> Result<String> {
+        let page = lock_with_timeout(&self.page, "page").await?.clone();
+        let script = format!(
+            r#"(() => {{ try {{ return JSON.stringify({}); }} catch(e) {{ return JSON.stringify({{error: e.message}}); }} }})()"#,
+            expression
+        );
+        let result = evaluate_with_timeout(&page, &script).await?;
+        let value = result.value().cloned().unwrap_or(serde_json::Value::String("null".to_string()));
+        let raw = match value {
+            serde_json::Value::String(s) => s,
+            other => other.to_string(),
+        };
+        Ok(raw)
+    }
+
     /// Wait for an element to appear on the page, by target_id, text content, or CSS selector.
     /// Returns the element's target_id if found, or an error if timed out.
     pub async fn wait_for_element(
@@ -1884,13 +1901,14 @@ impl BrowserState {
             new_ids
         };
 
-        // Focus the last new tab (most likely the one the user cares about)
+        // 发现新标签页：只更新 agent 内部 page 引用，不激活/不切换焦点。
+        // 避免抢用户当前正在浏览的标签页。
         if let Some(new_id) = new_tab_ids.last() {
             if let Some(new_page) = current_pages
                 .iter()
                 .find(|p| p.target_id().as_ref() == new_id.as_str())
             {
-                eprintln!("[tabs] Switching focus to new tab: {}", new_id);
+                eprintln!("[tabs] Adopting new tab (no focus switch): {}", new_id);
                 if let Ok(mut active) = lock_with_timeout(&self.page, "page").await {
                     *active = new_page.clone();
                 }
@@ -1923,13 +1941,13 @@ impl BrowserState {
         // Hermes #8 fix: collect ALL new tab IDs, not just the first one.
         let new_tab_ids: Vec<String> = current_ids.difference(known_before).cloned().collect();
 
-        // Focus the last new tab (most likely the one the user cares about)
+        // 发现新标签页：只更新 agent 内部 page 引用，不激活/不切换焦点。
         if let Some(new_id) = new_tab_ids.last() {
             if let Some(new_page) = current_pages
                 .iter()
                 .find(|p| p.target_id().as_ref() == new_id.as_str())
             {
-                eprintln!("[tabs] Switching focus to new tab: {}", new_id);
+                eprintln!("[tabs] Adopting new tab (no focus switch): {}", new_id);
                 if let Ok(mut active) = lock_with_timeout(&self.page, "page").await {
                     *active = new_page.clone();
                 }
