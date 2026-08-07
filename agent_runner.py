@@ -214,7 +214,10 @@ async def main():
         print("请提供任务描述")
         return
 
-    provider = os.environ.get("LLM_PROVIDER", "anthropic")
+    provider = os.environ.get("LLM_PROVIDER")
+    if not provider:
+        print("请设置 LLM_PROVIDER 环境变量（anthropic 或 openai）")
+        return
     max_steps = int(os.environ.get("AGENT_MAX_STEPS", "15"))
 
     print(f"LLM: {provider}, 最大步数: {max_steps}")

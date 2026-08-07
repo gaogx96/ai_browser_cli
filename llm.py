@@ -94,18 +94,24 @@ class LLMClient:
         if provider == "anthropic":
             key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
             if not key:
-                raise RuntimeError("ANTHROPIC_API_KEY 环境变量未设置")
+                raise RuntimeError("ANTHROPIC_API_KEY 或 ANTHROPIC_AUTH_TOKEN 环境变量未设置")
             base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+            model = os.environ.get("ANTHROPIC_MODEL")
+            if not model:
+                raise RuntimeError("ANTHROPIC_MODEL 环境变量未设置（例如 deepseek-v4-flash）")
             self._client = _AnthropicClient(key=key, base_url=base_url)
-            self._model = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
+            self._model = model
 
         elif provider == "openai":
             import openai
             key = os.environ.get("OPENAI_API_KEY")
             if not key:
                 raise RuntimeError("OPENAI_API_KEY 环境变量未设置")
+            model = os.environ.get("OPENAI_MODEL")
+            if not model:
+                raise RuntimeError("OPENAI_MODEL 环境变量未设置（例如 gpt-4o）")
             self._client = openai.AsyncOpenAI(api_key=key)
-            self._model = os.environ.get("OPENAI_MODEL", "gpt-4o")
+            self._model = model
 
         else:
             raise ValueError(f"不支持的 LLM provider: {provider}")
