@@ -9,6 +9,8 @@ Agent Runner — 浏览器自主规划 Agent。
 5. 循环直到 LLM 输出 stop 或超步数
 """
 
+from __future__ import annotations
+
 import asyncio
 import enum
 import json
@@ -28,21 +30,33 @@ _log = lambda *a, **kw: print(*a, **kw, file=sys.stderr, flush=True)
 
 
 class AgentResult:
-    """Agent 执行结果。"""
+    """Agent 执行结果。支持成功、失败、暂停三种状态。"""
 
     def __init__(self, success: bool, reason: str = "", steps: int = 0, history: list | None = None):
         self.success = success
         self.reason = reason
         self.steps = steps
         self.history = history or []
+        self.status: str = "success" if success else "failed"
+        self.checkpoint: "Checkpoint | None" = None
+
+    @classmethod
+    def paused(cls, checkpoint: "Checkpoint", reason: str = "用户介入") -> "AgentResult":
+        r = cls(success=False, reason=reason, steps=checkpoint.step)
+        r.status = "paused"
+        r.checkpoint = checkpoint
+        return r
 
     def __repr__(self) -> str:
+        if self.status == "paused":
+            return f"AgentResult(⏸ 暂停, 步数={self.steps}, 原因={self.reason})"
         status = "✅ 成功" if self.success else "❌ 失败"
         return f"AgentResult({status}, 步数={self.steps}, 原因={self.reason})"
 
     def to_dict(self) -> dict:
-        return {
+        d: dict = {
             "success": self.success,
+            "status": self.status,
             "reason": self.reason,
             "steps": self.steps,
             "history": [
@@ -55,6 +69,9 @@ class AgentResult:
                 for h in self.history
             ],
         }
+        if self.checkpoint:
+            d["checkpoint"] = self.checkpoint.to_dict()
+        return d
 
 
 # ── 阶段 1：数据模型与纯函数 ─────────────────────────────────────────────
@@ -480,6 +497,57 @@ class RecoveryDecision:
     max_attempts: int = 0
 
 
+# ── 阶段 6A：Pause / Resume ────────────────────────────────────────────────
+# 同一进程内 checkpoint + 暂停/恢复。恢复后必须重新观察页面，
+# 不复用旧 target_id 或旧 action。跨进程持久化暂不实现。
+
+
+class PauseReason(str, enum.Enum):
+    WAITING_FOR_USER = "waiting_for_user"
+    WAITING_FOR_PAGE = "waiting_for_page"
+    WAITING_FOR_EXTERNAL_EVENT = "waiting_for_external_event"
+
+
+@dataclass
+class Checkpoint:
+    version: int = 1
+    checkpoint_id: str = ""
+    session_id: str = ""
+    task: str = ""
+    current_goal: str | None = None
+    next_goal: str | None = None
+    completed_goals: list[str] = field(default_factory=list)
+    failed_attempts: list[str] = field(default_factory=list)
+    step: int = 0
+    page_url: str = ""
+    page_fingerprint: str | None = None
+    pause_reason: str = "waiting_for_user"
+    snapshot_available: bool = True
+
+    def to_dict(self) -> dict:
+        return {
+            "version": self.version,
+            "checkpoint_id": self.checkpoint_id,
+            "session_id": self.session_id,
+            "task": self.task,
+            "current_goal": self.current_goal,
+            "next_goal": self.next_goal,
+            "completed_goals": self.completed_goals,
+            "failed_attempts": self.failed_attempts,
+            "step": self.step,
+            "page_url": self.page_url,
+            "pause_reason": self.pause_reason,
+            "snapshot_available": self.snapshot_available,
+        }
+
+
+# 页面匹配等级（用于 resume 判断）
+class PageMatchLevel(enum.Enum):
+    STRONG = "strong"  # URL 相同 + 关键元素存在
+    WEAK = "weak"      # URL 属于同一流程
+    NONE = "none"      # URL 完全不同 / 错误页
+
+
 # ── Agent Runner ───────────────────────────────────────────────────────────
 
 
@@ -519,13 +587,17 @@ class AgentRunner:
         # off | shadow | active — 默认 off 保留旧逻辑
         self._recovery_retry_counts: dict[str, int] = {}  # 按 action_id 计数，非全局
 
-    async def run(self, task: str) -> AgentResult:
-        """执行一个自然语言浏览器任务。"""
+    async def run(self, task: str, initial_state: AgentState | None = None) -> AgentResult:
+        """执行一个自然语言浏览器任务。
+
+        initial_state: 可选的初始状态（用于 resume 恢复）。
+        提供时跳过 state 初始化，保留调用方设置的状态。
+        """
         self.history = []
         self.attempted = set()
         self._retry_counts = {}
         self._last_snapshot = None
-        self.state = AgentState(task=task)
+        self.state = initial_state or AgentState(task=task)
 
         for step in range(1, self.max_steps + 1):
             _log(f"\n--- Step {step}/{self.max_steps} ---")
@@ -569,6 +641,18 @@ class AgentRunner:
                     steps=step,
                     history=self.history,
                 )
+
+            # 6A. Pause 判断
+            if decision.is_pause:
+                pause_reason = decision.reason or "waiting_for_user"
+                _log(f"  Agent 暂停: {pause_reason}")
+                observation = (tree, meta)
+                checkpoint = await self._create_checkpoint(
+                    observation=observation,
+                    decision=decision,
+                    pause_reason=pause_reason,
+                )
+                return AgentResult.paused(checkpoint, reason=pause_reason)
 
             # 7. 阶段 3：shadow 验证前置快照（仅记录，不干预）
             if self._verify_mode != "off":
@@ -802,6 +886,113 @@ class AgentRunner:
             f"error={error} "
             f"reason={recovery.reason}"
         )
+
+    # ── 阶段 6A：Checkpoint / Pause / Resume ──────────────────────────────
+
+    async def _create_checkpoint(
+        self,
+        observation: tuple[str, dict],
+        decision: Decision,
+        pause_reason: str = "waiting_for_user",
+    ) -> Checkpoint:
+        """创建当前状态的 checkpoint。snapshot 失败时创建有限 checkpoint。"""
+        tree, meta = observation
+        page_url = str(meta.get("url", ""))
+        snapshot_available = True
+
+        try:
+            snapshot = await self._snapshot()
+            fingerprint = snapshot.dom_fingerprint
+            if not snapshot.snapshot_ok:
+                snapshot_available = False
+        except Exception:
+            fingerprint = None
+            snapshot_available = False
+
+        import uuid
+        ck = Checkpoint(
+            version=1,
+            checkpoint_id=str(uuid.uuid4())[:8],
+            session_id=str(uuid.uuid4())[:8],
+            task=self.state.task if self.state else "",
+            current_goal=self.state.current_goal if self.state else None,
+            next_goal=self.state.next_goal if self.state else None,
+            completed_goals=list(self.state.completed_goals) if self.state else [],
+            failed_attempts=list(self.state.failed_attempts) if self.state else [],
+            step=self.state.step if self.state else 0,
+            page_url=page_url,
+            page_fingerprint=fingerprint,
+            pause_reason=pause_reason,
+            snapshot_available=snapshot_available,
+        )
+        _log(f"  [checkpoint] created id={ck.checkpoint_id} reason={pause_reason} url={page_url}")
+        return ck
+
+    async def _match_checkpoint(
+        self, checkpoint: Checkpoint, observation: tuple[str, dict]
+    ) -> PageMatchLevel:
+        """判断当前页面与 checkpoint 的匹配程度。
+
+        不使用精确 DOM 指纹匹配（广告/动态内容会导致误报）。
+        不使用旧 target_id 或旧 action 作为恢复依据。
+        """
+        _, meta = observation
+        current_url = str(meta.get("url", ""))
+
+        # 强匹配：URL 相同
+        if current_url and checkpoint.page_url and current_url == checkpoint.page_url:
+            return PageMatchLevel.STRONG
+
+        # 弱匹配：URL 属于同一流程（同域名/同路径前缀）
+        if current_url and checkpoint.page_url:
+            from urllib.parse import urlparse
+            try:
+                ck_parsed = urlparse(checkpoint.page_url)
+                cur_parsed = urlparse(current_url)
+                if ck_parsed.netloc and ck_parsed.netloc == cur_parsed.netloc:
+                    # 同域名视为弱匹配
+                    return PageMatchLevel.WEAK
+            except Exception:
+                pass
+
+        # 不匹配
+        return PageMatchLevel.NONE
+
+    async def resume(
+        self,
+        checkpoint: Checkpoint,
+        new_task: str | None = None,
+    ) -> "AgentResult":
+        """从 checkpoint 恢复执行。恢复后重新观察页面，不使用旧 target/action。"""
+        _log(f"\n=== 恢复任务: checkpoint={checkpoint.checkpoint_id} ===")
+
+        # 初始化状态（从 checkpoint 恢复）
+        initial_state = AgentState(task=new_task or checkpoint.task)
+        initial_state.current_goal = checkpoint.current_goal
+        initial_state.next_goal = checkpoint.next_goal
+        initial_state.completed_goals = list(checkpoint.completed_goals)
+        initial_state.failed_attempts = list(checkpoint.failed_attempts)
+        initial_state.step = checkpoint.step
+
+        # 重新观察页面
+        observation = await self._observe()
+        tree, meta = observation
+        initial_state.observe(tree, meta)
+
+        # 判断页面匹配
+        match = await self._match_checkpoint(checkpoint, observation)
+        _log(f"  [resume] 页面匹配: {match.value} (url={meta.get('url', '')})")
+
+        if match == PageMatchLevel.NONE:
+            _log(f"  [resume] 页面不匹配，重新规划")
+            initial_state.current_goal = None
+            initial_state.goal_status = "not_started"
+
+        elif match == PageMatchLevel.WEAK:
+            _log(f"  [resume] 页面弱匹配，继续当前目标但可能需重新规划")
+
+        # 进入主循环，传入 initial_state 避免 run() 重新初始化
+        return await self.run(new_task or checkpoint.task, initial_state=initial_state)
 
     async def _observe(self) -> tuple[str, dict]:
         """获取当前页面状态。"""
