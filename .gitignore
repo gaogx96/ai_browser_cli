@@ -33,4 +33,4 @@ dist/
 *.tmp
 
 # Shadow data collection
-shadow_data*.jsonl
+shadow*.jsonl
