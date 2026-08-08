@@ -559,6 +559,7 @@ class AgentState:
     session_id: str = ""  # P8-D：用于事件关联
     goal_transitions: list[dict] = field(default_factory=list)  # P8-D：目标推进记录
     blocked_targets: dict[str, str] = field(default_factory=dict)  # target_id → reason（C3-3：供 LLM 上下文）
+    last_successful_action: dict | None = None  # C3-D：最近成功动作事实（供 LLM 上下文反馈）
 
     @staticmethod
     def _normalize_goal(goal: str | None) -> str:
@@ -700,6 +701,14 @@ class AgentState:
             for tid, reason in self.blocked_targets.items():
                 blocked_lines.append(f"{tid}: {reason}")
             lines.append("不可用目标: " + " | ".join(blocked_lines))
+        if self.last_successful_action:
+            # C3-D：最近成功动作反馈，避免 LLM 重复执行
+            la = self.last_successful_action
+            lines.append(
+                f"最近动作已成功: {la.get('action_type', '')}"
+                f"(target={la.get('target_id', '')} effects={','.join(la.get('effects', []))})"
+                " — 不要重复执行相同输入"
+            )
         lines.append("最近观察:")
         lines.append(self.last_observation_summary)
         return "\n".join(lines)
@@ -1145,6 +1154,11 @@ class AgentRunner:
         self._raw_evaluate_mode = os.environ.get("AGENT_RAW_EVALUATE", "off").lower()
         # off | shadow | active — 默认 off（拒绝 LLM 生成任意 JS）
 
+        # C3-D：冗余动作防护（成功动作去重）
+        self._redundant_guard_mode = os.environ.get("AGENT_REDUNDANT_GUARD", "off").lower()
+        # off | shadow | active — 默认 off
+        self._last_success_sig: str = ""  # 上次成功动作签名
+
         # P8-D：可观测性配置
         self._observability = os.environ.get("AGENT_OBSERVABILITY", "stderr").lower()
         # off | stderr | jsonl — 默认 stderr，jsonl 适合统计/误判分析
@@ -1292,6 +1306,23 @@ class AgentRunner:
                         assessment, applied=c2_applied,
                         action_type=decision.action_type,
                     )
+
+                    # C3-D：成功动作事实跟踪
+                    if verification.status == "success" and self.state and decision.action_type in ("type", "set_value", "click", "focus"):
+                        effects_list = []
+                        if effects.form_changed:
+                            effects_list.append("form_changed")
+                        if effects.url_changed:
+                            effects_list.append("url_changed")
+                        if effects.dom_changed:
+                            effects_list.append("dom_changed")
+                        if effects.focus_changed:
+                            effects_list.append("focus_changed")
+                        self.state.last_successful_action = {
+                            "action_type": decision.action_type,
+                            "target_id": decision.target_id,
+                            "effects": effects_list,
+                        }
             else:
                 after = None
                 verification = None
@@ -1752,6 +1783,29 @@ class AgentRunner:
             return None
 
         return None
+
+    # ── C3-D：冗余动作检测 ──────────────────────────────────────────────
+
+    def _is_redundant_action(self, decision: Decision, verification: ActionVerification | None) -> bool:
+        """检测是否重复执行已成功的动作。
+
+        签名：action_type + target_id + value + page_fingerprint digest。
+        只在 active 模式下拦截。
+        """
+        if self._redundant_guard_mode != "active":
+            return False
+        if not verification or verification.status != "success":
+            return False
+        # 构建签名
+        import hashlib
+        sig_parts = [decision.action_type, decision.target_id, decision.text or ""]
+        sig = ":".join(sig_parts)
+        digest = hashlib.sha256(sig.encode()).hexdigest()[:12]
+        if digest == self._last_success_sig:
+            _log(f"  [redundant] 重复成功动作: {decision.action_type} target={decision.target_id}")
+            return True
+        self._last_success_sig = digest
+        return False
 
     # ── C3-1：动作前 target 验证 ────────────────────────────────────────
 
