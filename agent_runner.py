@@ -340,6 +340,7 @@ class Decision:
     evaluation_previous_goal: str = ""
     memory: str = ""
     is_pause: bool = False
+    operation: str = ""  # C3-2：结构化操作（focus/set_value 等）
 
     def to_action_dict(self) -> dict:
         """转回 AgentRunner 现有 _execute() 期望的扁平动作 dict。"""
@@ -356,7 +357,138 @@ class Decision:
             d["path"] = self.path
         if self.reason:
             d["reason"] = self.reason
+        if self.operation:
+            d["operation"] = self.operation
         return d
+
+
+# ── C3-2：结构化 Evaluate ────────────────────────────────────────────────
+# 不依赖 LLM 生成任意 JavaScript。结构化操作由框架生成固定脚本。
+
+
+class EvaluateOperation(str, enum.Enum):
+    FOCUS = "focus"
+    SET_VALUE = "set_value"
+    SCROLL_INTO_VIEW = "scroll_into_view"
+    DISPATCH_INPUT = "dispatch_input"
+    DISPATCH_CHANGE = "dispatch_change"
+    READ_PROPERTY = "read_property"
+
+
+@dataclass
+class EvaluateRequest:
+    operation: str
+    target_id: str | None = None
+    value: str | None = None
+    property_name: str | None = None
+
+
+def _js_quote(s: str) -> str:
+    """安全转义 JS 字符串，防止引号/换行/Unicode 破坏脚本。"""
+    return json.dumps(s, ensure_ascii=False)
+
+
+def generate_script(req: EvaluateRequest) -> str:
+    """根据结构化操作生成固定脚本。参数通过安全序列化注入。"""
+    op = req.operation
+
+    if op == EvaluateOperation.FOCUS:
+        return r"""
+        (() => {
+          const el = document.querySelector('[data-agent-id="%s"]');
+          if (!el) return {ok: false, reason: 'not_found'};
+          el.focus();
+          return {ok: true, focused: document.activeElement === el};
+        })()
+        """ % req.target_id.replace('"', '\\"')
+
+    if op == EvaluateOperation.SET_VALUE:
+        # 设置 value 并派发 input/change 事件（兼容 React/Vue 框架）
+        return r"""
+        (() => {
+          const el = document.querySelector('[data-agent-id="%s"]');
+          if (!el) return {ok: false, reason: 'not_found'};
+          const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+          )?.set || Object.getOwnPropertyDescriptor(
+            window.HTMLTextAreaElement.prototype, 'value'
+          )?.set;
+          if (setter) setter.call(el, %s);
+          else el.value = %s;
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          return {ok: true, value_set: el.value === %s};
+        })()
+        """ % (req.target_id.replace('"', '\\"'), _js_quote(req.value or ""),
+               _js_quote(req.value or ""), _js_quote(req.value or ""))
+
+    if op == EvaluateOperation.SCROLL_INTO_VIEW:
+        return r"""
+        (() => {
+          const el = document.querySelector('[data-agent-id="%s"]');
+          if (!el) return {ok: false, reason: 'not_found'};
+          el.scrollIntoView({behavior: 'smooth', block: 'center'});
+          return {ok: true};
+        })()
+        """ % req.target_id.replace('"', '\\"')
+
+    if op == EvaluateOperation.DISPATCH_INPUT:
+        return r"""
+        (() => {
+          const el = document.querySelector('[data-agent-id="%s"]');
+          if (!el) return {ok: false, reason: 'not_found'};
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          return {ok: true};
+        })()
+        """ % req.target_id.replace('"', '\\"')
+
+    if op == EvaluateOperation.DISPATCH_CHANGE:
+        return r"""
+        (() => {
+          const el = document.querySelector('[data-agent-id="%s"]');
+          if (!el) return {ok: false, reason: 'not_found'};
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+          return {ok: true};
+        })()
+        """ % req.target_id.replace('"', '\\"')
+
+    if op == EvaluateOperation.READ_PROPERTY:
+        prop = req.property_name or "value"
+        return r"""
+        (() => {
+          const el = document.querySelector('[data-agent-id="%s"]');
+          if (!el) return {ok: false, reason: 'not_found'};
+          const v = el[%s];
+          if (typeof v === 'string') return {ok: true, value: v.length > 100 ? v.substring(0, 100) : v, truncated: v.length > 100};
+          return {ok: true, value: v};
+        })()
+        """ % (req.target_id.replace('"', '\\"'), _js_quote(prop))
+
+    return r"(() => { return {ok: false, reason: 'unknown_operation'}; })()"
+
+
+def normalize_evaluate_operation(action: dict) -> EvaluateRequest | None:
+    """从 Decision 中提取结构化 evaluate 操作。
+
+    支持两种格式：
+    - {"action": "evaluate", "operation": "focus", "target_id": "e5"}
+    - {"action": "focus", "target_id": "e5"}  (直接结构化动作)
+    """
+    op = action.get("operation", "")
+    if op:
+        return EvaluateRequest(
+            operation=op,
+            target_id=action.get("target_id", ""),
+            value=action.get("value", ""),
+            property_name=action.get("property_name", ""),
+        )
+    return None
+
+
+# ── 结构化操作白名单（可由 LLM 直接输出为 action） ─────────────────────
+STRUCTURED_EVALUATE_ACTIONS = {
+    "focus", "set_value", "scroll_into_view", "dispatch_input", "dispatch_change", "read_property",
+}
 
 
 def normalize_decision(raw: dict) -> Decision:
@@ -375,6 +507,7 @@ def normalize_decision(raw: dict) -> Decision:
         expression = action.get("expression", "")
         path = action.get("path", "")
         reason = action.get("reason", "")
+        operation = action.get("operation", "")
     # 扁平格式: {"action": "click", "target_id": "e5"}
     else:
         action_type = str(action)
@@ -384,6 +517,7 @@ def normalize_decision(raw: dict) -> Decision:
         expression = raw.get("expression", "")
         path = raw.get("path", "")
         reason = raw.get("reason", "")
+        operation = raw.get("operation", "")
 
     return Decision(
         action_type=action_type,
@@ -397,6 +531,7 @@ def normalize_decision(raw: dict) -> Decision:
         evaluation_previous_goal=str(raw.get("evaluation_previous_goal", "")),
         memory=str(raw.get("memory", "")),
         is_pause=(action_type == "pause"),
+        operation=str(operation),
     )
 
 
@@ -995,6 +1130,10 @@ class AgentRunner:
         self._action_guard_mode = os.environ.get("AGENT_ACTION_GUARD", "off").lower()
         # off | shadow | active — 默认 off
         # active 只拦截明确 invalid，unknown 放行
+
+        # C3-2：raw evaluate 开关
+        self._raw_evaluate_mode = os.environ.get("AGENT_RAW_EVALUATE", "off").lower()
+        # off | shadow | active — 默认 off（拒绝 LLM 生成任意 JS）
 
         # P8-D：可观测性配置
         self._observability = os.environ.get("AGENT_OBSERVABILITY", "stderr").lower()
@@ -2009,10 +2148,38 @@ class AgentRunner:
                 return {"success": True, "data": resp}
 
             elif act == "evaluate":
+                # 尝试结构化操作（C3-2）
+                eval_req = normalize_evaluate_operation(action)
+                if eval_req and eval_req.operation:
+                    script = generate_script(eval_req)
+                    if script:
+                        resp = await self.browser.send_command("evaluate", expression=script)
+                        return {"success": True, "data": resp}
+                    return {"success": False, "error": f"evaluate 脚本生成失败: {eval_req.operation}"}
+
+                # raw evaluate（LLM 直接生成 JS）
                 expression = action.get("expression", "")
                 if not expression:
                     return {"success": False, "error": "缺少 expression 参数"}
+                if self._raw_evaluate_mode == "off":
+                    return {"success": False, "error": "raw evaluate 已禁用（AGENT_RAW_EVALUATE=off）"}
+                if self._raw_evaluate_mode == "shadow":
+                    _log(f"  [raw_evaluate] 长度={len(expression)} 前100字={expression[:100]}")
                 resp = await self.browser.send_command("evaluate", expression=expression)
+                return {"success": True, "data": resp}
+
+            # 结构化操作（C3-2：直接作为 action 输出）
+            elif act in STRUCTURED_EVALUATE_ACTIONS:
+                eval_req = EvaluateRequest(
+                    operation=act,
+                    target_id=action.get("target_id", ""),
+                    value=action.get("value", ""),
+                    property_name=action.get("property_name", ""),
+                )
+                script = generate_script(eval_req)
+                if not script:
+                    return {"success": False, "error": f"操作 {act} 脚本生成失败"}
+                resp = await self.browser.send_command("evaluate", expression=script)
                 return {"success": True, "data": resp}
 
             elif act == "download_setup":

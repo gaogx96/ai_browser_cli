@@ -230,8 +230,11 @@ class LLMClient:
         if "action" not in action:
             action = {"action": "stop", "reason": f"LLM 输出缺少 action 字段: {raw[:200]}"}
 
-        # 校验 action 值合法性
-        valid_actions = {"navigate", "click", "type", "evaluate", "download_setup", "stop", "pause"}
+        # 校验 action 值合法性（含结构化操作：focus/set_value/scroll_into_view 等）
+        valid_actions = {
+            "navigate", "click", "type", "evaluate", "download_setup", "stop", "pause",
+            "focus", "set_value", "scroll_into_view", "dispatch_input", "dispatch_change", "read_property",
+        }
         if action["action"] not in valid_actions:
             action = {"action": "stop", "reason": f"LLM 输出了非法 action: {action.get('action')}"}
 
