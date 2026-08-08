@@ -125,6 +125,18 @@ class LLMClient:
             self._client = openai.AsyncOpenAI(api_key=key)
             self._model = model
 
+        elif provider == "deepseek":
+            # DeepSeek 使用 OpenAI-compatible 格式，但 httpx 直连（避免 SDK 依赖）
+            key = os.environ.get("DEEPSEEK_API_KEY")
+            if not key:
+                raise RuntimeError("DEEPSEEK_API_KEY 环境变量未设置")
+            base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+            model = os.environ.get("DEEPSEEK_MODEL")
+            if not model:
+                raise RuntimeError("DEEPSEEK_MODEL 环境变量未设置（例如 deepseek-v4-flash）")
+            self._client = _OpenAICompatibleClient(key=key, base_url=base_url)
+            self._model = model
+
         else:
             raise ValueError(f"不支持的 LLM provider: {provider}")
 
@@ -200,6 +212,19 @@ class LLMClient:
                 ],
             )
             raw = resp.choices[0].message.content or ""
+
+        elif self.provider == "deepseek":
+            raw = await self._client.chat_completions_create(
+                model=self._model,
+                max_tokens=2048,
+                messages=[
+                    {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+                    *messages,
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                reasoning_effort="low",
+            )
 
         else:
             raise ValueError(f"不支持的 provider: {self.provider}")
@@ -301,3 +326,65 @@ class _AnthropicClient:
             if block.get("type") == "text":
                 texts.append(block.get("text", ""))
         return "\n".join(texts)
+
+
+# ── OpenAI-compatible 客户端（DeepSeek 等） ──────────────────────────────
+
+
+class _OpenAICompatibleClient:
+    """使用 httpx 直连 OpenAI-compatible API（DeepSeek 等）。
+
+    请求格式：POST /v1/chat/completions
+    响应解析：data["choices"][0]["message"]["content"]
+    """
+
+    def __init__(self, key: str, base_url: str):
+        import httpx
+        self._key = key
+        self._base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(
+            base_url=self._base_url,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            timeout=120,
+        )
+
+    async def chat_completions_create(
+        self,
+        *,
+        model: str,
+        max_tokens: int,
+        messages: list[dict],
+        response_format: dict | None = None,
+        temperature: float = 0.1,
+        reasoning_effort: str = "low",
+        stream: bool = False,
+    ) -> str:
+        """调用 OpenAI-compatible chat completions API，返回文本内容。"""
+        body: dict = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": stream,
+        }
+        if response_format:
+            body["response_format"] = response_format
+        # reasoning_effort 是 DeepSeek 扩展参数，非标准 OpenAI 字段
+        if reasoning_effort:
+            body["reasoning_effort"] = reasoning_effort
+
+        resp = await self._client.post("/v1/chat/completions", json=body)
+        if resp.status_code != 200:
+            error_text = resp.text[:500]
+            raise RuntimeError(
+                f"OpenAI-compatible API 调用失败 (HTTP {resp.status_code}): {error_text}"
+            )
+        data = resp.json()
+        # 解析 choices[0].message.content
+        try:
+            return data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            raise RuntimeError(f"无法解析 OpenAI-compatible 响应: {str(data)[:300]}")

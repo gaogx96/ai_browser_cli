@@ -1,11 +1,14 @@
 """API 健康检查脚本（公共接口，不调用私有方法）。
 
 运行：
+    export LLM_PROVIDER=deepseek
+    export DEEPSEEK_API_KEY=sk-xxx
+    export DEEPSEEK_MODEL=deepseek-v4-flash
     python tests/check_api.py
-    # 需要 LLM_PROVIDER 和对应 API key 环境变量
 """
 
 import asyncio
+import json
 import os
 import sys
 
@@ -15,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 async def main():
     provider = os.environ.get("LLM_PROVIDER", "")
     if not provider:
-        print("请设置 LLM_PROVIDER 环境变量")
+        print("请设置 LLM_PROVIDER 环境变量（deepseek 或 anthropic 或 openai）")
         sys.exit(1)
 
     from llm import LLMClient
@@ -31,10 +34,11 @@ async def main():
             history=[],
         )
         action = result.get("action", "?")
-        print(f"API OK (action={action})")
+        thought = result.get("thought", "")[:30]
+        print(f"API OK (action={action}, thought={thought})")
         return True
     except Exception as e:
-        print(f"API FAIL: {str(e)[:100]}")
+        print(f"API FAIL: {str(e)[:200]}")
         return False
 
 
