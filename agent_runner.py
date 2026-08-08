@@ -1938,7 +1938,11 @@ class AgentRunner:
         return await self.run(new_task or checkpoint.task, initial_state=initial_state)
 
     async def _observe(self) -> tuple[str, dict]:
-        """获取当前页面状态。"""
+        """获取当前页面状态。
+
+        CDP 大页面响应可能触发 chunk 解析错误（"Separator is not found"）。
+        此时 tree 返回错误文本，meta 仍可正常获取。
+        """
         try:
             meta = await self.browser.meta()
         except Exception as e:
@@ -1947,7 +1951,12 @@ class AgentRunner:
         try:
             tree = await self.browser.tree()
         except Exception as e:
-            tree = f"[获取页面树失败: {e}]"
+            error_msg = str(e)
+            # 检测 CDP 大页面解析错误
+            if "chunk" in error_msg.lower() and ("separator" in error_msg.lower() or "exceed" in error_msg.lower()):
+                tree = f"[PAGE_TOO_LARGE] CDP 响应解析失败，页面可能过大。建议使用 evaluate 获取特定元素。{error_msg[:100]}"
+            else:
+                tree = f"[获取页面树失败: {error_msg}]"
 
         return tree, meta
 

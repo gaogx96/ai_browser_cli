@@ -17,10 +17,13 @@
 /// Truncated to 50 chars max. Empty text omitted.
 pub const EXTRACT_TREE_SCRIPT: &str = r#"
 (() => {
+    const MAX_NODES = 300;
     const elements = document.querySelectorAll('[data-agent-id]');
     const lines = [];
+    const total = elements.length;
 
-    for (const el of elements) {
+    for (let i = 0; i < Math.min(elements.length, MAX_NODES); i++) {
+        const el = elements[i];
         const id = el.getAttribute('data-agent-id');
 
         // Determine role
@@ -88,7 +91,11 @@ pub const EXTRACT_TREE_SCRIPT: &str = r#"
         lines.push(line);
     }
 
-    return lines.join('\n');
+    let result = lines.join('\n');
+    if (total > MAX_NODES) {
+        return result + '\n... (' + total + ' elements, showing first ' + MAX_NODES + ')';
+    }
+    return result;
 })()
 "#;
 
