@@ -28,9 +28,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 # 收集的测试任务
 TEST_TASKS = [
     "打开 https://example.com 并告诉我页面标题",
-    # 添加更多任务来收集样本：
-    # "在百度搜索 Rust 并点击第一条结果",
-    # "打开 https://github.com 并读取页面标题",
+    "打开 https://www.baidu.com 并读取页面标题",
+    "打开 https://www.bing.com 并搜索 Rust",
+    "打开 https://www.baidu.com 并搜索 Rust",
 ]
 
 JSONL_PATH = os.environ.get("AGENT_OBSERVABILITY_PATH", "shadow_data.jsonl")
