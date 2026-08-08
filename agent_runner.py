@@ -403,18 +403,22 @@ def generate_script(req: EvaluateRequest) -> str:
         """ % req.target_id.replace('"', '\\"')
 
     if op == EvaluateOperation.SET_VALUE:
-        # 设置 value 并派发 input/change 事件（兼容 React/Vue 框架）
+        # 设置 value 并派发 input/change 事件。
+        # 直接赋值 + dispatchEvent 在大多数框架（包括 React/Vue）中有效。
+        # 注意：某些浏览器中 Object.getOwnPropertyDescriptor 的 setter
+        # 会抛出 'Illegal invocation'，因此优先使用直接赋值 + 事件派发。
         return r"""
         (() => {
           const el = document.querySelector('[data-agent-id="%s"]');
           if (!el) return {ok: false, reason: 'not_found'};
-          const setter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value'
-          )?.set || Object.getOwnPropertyDescriptor(
-            window.HTMLTextAreaElement.prototype, 'value'
+          const nativeSetter = Object.getOwnPropertyDescriptor(
+            (el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement : window.HTMLInputElement).prototype, 'value'
           )?.set;
-          if (setter) setter.call(el, %s);
-          else el.value = %s;
+          if (nativeSetter) {
+            nativeSetter.call(el, %s);
+          } else {
+            el.value = %s;
+          }
           el.dispatchEvent(new Event('input', {bubbles: true}));
           el.dispatchEvent(new Event('change', {bubbles: true}));
           return {ok: true, value_set: el.value === %s};
