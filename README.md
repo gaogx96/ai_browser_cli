@@ -119,6 +119,9 @@ python agent_runner.py "打开 https://example.com 并读取标题"
 | `AGENT_OBSERVABILITY_PATH` | `""` | JSONL 输出文件路径（为空时 jsonl 输出到 stderr） |
 | `AGENT_MAX_STEPS` | `15` | 最大步数 |
 | `AGENT_LLM_DELAY` | `0` | LLM 调用间延迟（秒），用于低配额 API |
+| `AGENT_ACTION_GUARD` | `off` | 动作前 target 验证：`off` / `shadow` / `active` |
+| `AGENT_LOOP_GUARD` | `off` | 循环防护（重复 no_effect 检测）：`off` / `shadow` / `active` |
+| `AGENT_RAW_EVALUATE` | `off` | 原始 JavaScript 执行：`off` / `shadow` / `active`（默认拒绝 LLM 生成任意 JS） |
 
 ### 暂停与恢复（Pause / Resume）
 
