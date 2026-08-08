@@ -965,8 +965,11 @@ class AgentRunner:
                     # C2 严格状态更新：仅 active 模式 + 高置信度规则证据
                     c2_applied = False
                     if self._goal_assessment_mode == "active" and self.state:
-                        if should_accept_completion(assessment):
-                            # 只更新 completed_goals 和推进 current_goal，
+                        # C2 严格模式：不接受 LLM-only 判断
+                        if assessment.source == "llm":
+                            pass
+                        elif should_accept_completion(assessment):
+                            # 只更新 completed_goals，
                             # 不自动 stop，不跳过 LLM，不触发 recovery
                             goal_key = self.state._normalize_goal(assessment.goal or "")
                             norm_current = self.state._normalize_goal(self.state.current_goal)
