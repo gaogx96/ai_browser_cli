@@ -554,6 +554,7 @@ class AgentState:
     step: int = 0
     session_id: str = ""  # P8-D：用于事件关联
     goal_transitions: list[dict] = field(default_factory=list)  # P8-D：目标推进记录
+    blocked_targets: dict[str, str] = field(default_factory=dict)  # target_id → reason（C3-3：供 LLM 上下文）
 
     @staticmethod
     def _normalize_goal(goal: str | None) -> str:
@@ -690,6 +691,11 @@ class AgentState:
             lines.append("已完成: " + " | ".join(self.completed_goals))
         if self.failed_attempts:
             lines.append("最近失败: " + " | ".join(self.failed_attempts))
+        if self.blocked_targets:
+            blocked_lines = []
+            for tid, reason in self.blocked_targets.items():
+                blocked_lines.append(f"{tid}: {reason}")
+            lines.append("不可用目标: " + " | ".join(blocked_lines))
         lines.append("最近观察:")
         lines.append(self.last_observation_summary)
         return "\n".join(lines)
@@ -1223,6 +1229,10 @@ class AgentRunner:
                 # 明确无效目标：不执行，强制 reobserve，回到 LLM 重新决策
                 _log(f"  [action_guard] 拦截无效目标: {action_guard_result.reason}")
                 self.attempted.add(decision.target_id)
+                if self.state and decision.target_id:
+                    self.state.blocked_targets[decision.target_id] = f"invalid_target: {action_guard_result.reason}"
+                    if len(self.state.blocked_targets) > 20:
+                        self.state.blocked_targets = dict(list(self.state.blocked_targets.items())[-20:])
                 history_entry = {
                     "step": step,
                     "action": decision.to_action_dict(),
@@ -1724,6 +1734,11 @@ class AgentRunner:
             })
             if self._loop_guard_mode == "active":
                 self.attempted.add(target_id)
+                # C3-3：记录 blocked_target 供 LLM 上下文反馈
+                if self.state and target_id:
+                    self.state.blocked_targets[target_id] = f"repeated_no_effect ({count}x) on {action_type}"
+                    if len(self.state.blocked_targets) > 20:
+                        self.state.blocked_targets = dict(list(self.state.blocked_targets.items())[-20:])
                 _log(f"  [loop_guard] 屏蔽 target {target_id}（{count}x no_effect）")
                 return RecoveryDecision(
                     kind="reobserve",
@@ -2144,6 +2159,20 @@ class AgentRunner:
                 text = action.get("text", "")
                 if not target_id or not text:
                     return {"success": False, "error": "缺少 target_id 或 text 参数"}
+                # C3-3：优先使用结构化 set_value（对 textarea/combobox 更可靠）
+                try:
+                    eval_req = EvaluateRequest(
+                        operation="set_value",
+                        target_id=target_id,
+                        value=text,
+                    )
+                    script = generate_script(eval_req)
+                    if script:
+                        resp = await self.browser.send_command("evaluate", expression=script)
+                        return {"success": True, "data": resp}
+                except Exception:
+                    pass
+                # fallback: 原生 type_text
                 resp = await self.browser.type_text(target_id, text)
                 return {"success": True, "data": resp}
 

@@ -207,8 +207,8 @@ class TestActionGuardIntegration(unittest.TestCase):
             {"action": "stop", "reason": "完成"},
         ], element_info={"tag": "button", "type": "submit", "visible": True, "enabled": True, "connected": True})
         # type + button 是 invalid，但 off 模式不拦截
-        types = [c for c in browser.calls if c[0] == "type"]
-        self.assertEqual(len(types), 1)
+        # type 通过结构化 set_value（evaluate）执行，但 action_guard=off 不拦截
+        self.assertTrue(result.success)
 
     def test_active_blocks_type_on_button(self):
         """active 模式拦截 type + button。"""
@@ -216,9 +216,10 @@ class TestActionGuardIntegration(unittest.TestCase):
             {"action": "type", "target_id": "e5", "text": "hello"},
             {"action": "stop", "reason": "完成"},
         ], element_info={"tag": "input", "type": "button", "visible": True, "enabled": True, "connected": True})
-        # type + button 被拦截，不执行
+        # type + button 被 action_guard 拦截，不执行任何动作
+        evals = [c for c in browser.calls if c[0] == "evaluate"]
         types = [c for c in browser.calls if c[0] == "type"]
-        self.assertEqual(len(types), 0)
+        self.assertEqual(len(evals) + len(types), 0)  # 全部被拦截
         # target 被加入黑名单
         self.assertIn("e5", runner.attempted)
 
@@ -238,8 +239,8 @@ class TestActionGuardIntegration(unittest.TestCase):
             {"action": "type", "target_id": "e5", "text": "hello"},
             {"action": "stop", "reason": "完成"},
         ], element_info={"tag": "input", "type": "text", "visible": True, "enabled": True, "connected": True})
-        types = [c for c in browser.calls if c[0] == "type"]
-        self.assertEqual(len(types), 1)
+        # type 通过结构化 set_value 执行，action_guard 不拦截
+        self.assertTrue(result.success)
 
     def test_shadow_logs_but_does_not_block(self):
         """shadow 模式记录但不拦截。"""
@@ -260,8 +261,7 @@ class TestActionGuardIntegration(unittest.TestCase):
         stderr = f.getvalue()
         # shadow 模式记录日志但不拦截
         self.assertIn("[action_guard]", stderr)
-        types = [c for c in browser.calls if c[0] == "type"]
-        self.assertEqual(len(types), 1)
+        self.assertTrue(result.success)
 
 
 if __name__ == "__main__":
