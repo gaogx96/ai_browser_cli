@@ -698,14 +698,21 @@ def assess_from_rules(action_type: str, before: PageSnapshot | None, after: Page
             evidence.append(GoalEvidence("element_present", "新标签页已打开", weight=0.9))
         if effects.dom_changed:
             evidence.append(GoalEvidence("element_present", "页面 DOM 已变化", weight=0.5))
-        if effects.focus_changed:
-            # 点击后焦点变化 → 说明点击有效（如聚焦输入框）
-            evidence.append(GoalEvidence("focus_received", "页面焦点已变化", weight=0.85))
         if effects.form_changed:
             evidence.append(GoalEvidence("form_state", "表单状态已变化", weight=0.7))
+        # focus_changed 是辅助信号（浏览器 click 不保证 focus），
+        # 不能单独作为完成证据；只在有其他强证据时作为补充。
+        focus_aux = effects.focus_changed
         if evidence:
             status = "completed"
             confidence = min(0.3 + 0.5 * len(evidence), 0.9)
+            if focus_aux:
+                evidence.append(GoalEvidence("focus_received", "页面焦点已变化（辅助信号）", weight=0.2))
+        elif focus_aux:
+            # 仅焦点变化 → partial，不判 completed
+            status = "partial"
+            confidence = 0.4
+            evidence.append(GoalEvidence("focus_received", "仅焦点变化（辅助信号）", weight=0.2))
 
     elif action_type == "type":
         if effects.form_changed:
@@ -955,8 +962,21 @@ class AgentRunner:
                         after=after,
                         effects=effects,
                     )
+                    # C2 严格状态更新：仅 active 模式 + 高置信度规则证据
+                    c2_applied = False
+                    if self._goal_assessment_mode == "active" and self.state:
+                        if should_accept_completion(assessment):
+                            # 只更新 completed_goals 和推进 current_goal，
+                            # 不自动 stop，不跳过 LLM，不触发 recovery
+                            goal_key = self.state._normalize_goal(assessment.goal or "")
+                            norm_current = self.state._normalize_goal(self.state.current_goal)
+                            if goal_key and goal_key == norm_current:
+                                self.state.mark_goal_completed(assessment.goal)
+                                c2_applied = True
+                                _log(f"  [c2] 目标完成: {assessment.goal}")
+
                     self._log_assessment(
-                        assessment, applied=False,
+                        assessment, applied=c2_applied,
                         action_type=decision.action_type,
                     )
             else:

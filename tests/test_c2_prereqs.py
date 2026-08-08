@@ -244,14 +244,14 @@ class TestClickFocusEvidence(unittest.TestCase):
     def _snap(self, focused=None):
         return PageSnapshot("t1", "https://a.com", "A", "fp", {}, focused, (self.t1,), True)
 
-    def test_focus_changed_completed(self):
-        """点击输入框导致焦点变化 → focus_received 证据 → completed。"""
+    def test_focus_changed_partial(self):
+        """仅焦点变化（无其他证据）→ partial，不判 completed。"""
         before = self._snap(focused=None)
         after = self._snap(focused={"tag": "input", "id": "kw", "type": "text"})
         effects = ActionEffects(focus_changed=True)
         a = assess_from_rules("click", before, after, effects, "点击搜索框")
-        self.assertEqual(a.status, "completed")
-        self.assertTrue(any(e.kind == "focus_received" for e in a.evidence))
+        self.assertEqual(a.status, "partial")
+        self.assertFalse(any(e.weight >= 0.7 for e in a.evidence))  # 无强证据
 
     def test_click_no_change_not_completed(self):
         """点击普通按钮无变化 → 不误判完成。"""
