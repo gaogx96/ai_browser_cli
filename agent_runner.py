@@ -807,6 +807,141 @@ def should_accept_completion(assessment: GoalAssessment) -> bool:
     return False
 
 
+# ── C3-1：TargetValidation ────────────────────────────────────────────────
+# 动作前 target 验证。三态结果：valid / invalid / unknown。
+# unknown 不阻断（CDP 页面导航时无法可靠读取元素状态）。
+
+
+@dataclass
+class TargetValidation:
+    status: str  # valid | invalid | unknown
+    target_id: str
+    action_type: str
+    reason: str | None = None
+    tag: str | None = None
+    role: str | None = None
+    visible: bool | None = None
+    enabled: bool | None = None
+    connected: bool | None = None
+
+
+# 动作类型 → 允许的 tag/role 集合
+ALLOWED_TAGS_FOR_TYPE: set[str] = {"input", "textarea"}
+ALLOWED_ROLES_FOR_TYPE: set[str] = {"textbox", "searchbox", "combobox", "contenteditable"}
+ALLOWED_TAGS_FOR_CLICK: set[str] = {
+    "a", "button", "input", "select", "textarea", "summary", "details", "label",
+}
+ALLOWED_ROLES_FOR_CLICK: set[str] = {
+    "button", "link", "checkbox", "radio", "tab", "menuitem", "option",
+    "switch", "combobox", "spinbutton", "slider", "searchbox", "textbox",
+}
+
+# 排除的 type 值（用于 type 动作）
+EXCLUDED_TYPES_FOR_TYPE: set[str] = {"button", "submit", "checkbox", "radio", "file", "hidden"}
+
+
+def validate_target(target_id: str, action_type: str, element_info: dict | None) -> TargetValidation:
+    """验证目标元素是否适合执行指定动作。
+
+    三态：
+    - valid: 明确可以执行
+    - invalid: 明确不能执行（如 type + button）
+    - unknown: 无法可靠确认（如页面正在导航）
+
+    注意：不要过度拦截（如普通 div + click 应允许）。
+    """
+    if not target_id:
+        return TargetValidation("invalid", target_id, action_type, reason="target_id 为空")
+
+    if element_info is None:
+        return TargetValidation("unknown", target_id, action_type, reason="无法读取元素信息")
+
+    tag = (element_info.get("tag") or "").lower()
+    role = (element_info.get("role") or "").lower()
+    elem_type = (element_info.get("type") or "").lower()
+    visible = element_info.get("visible", False)
+    enabled = element_info.get("enabled", True)
+    connected = element_info.get("connected", True)
+
+    if not connected:
+        return TargetValidation("invalid", target_id, action_type, reason="元素已脱离 DOM",
+                                tag=tag, role=role, connected=False)
+
+    if not visible:
+        return TargetValidation("invalid", target_id, action_type, reason="元素不可见",
+                                tag=tag, role=role, visible=False)
+
+    if action_type == "type":
+        return _validate_type_target(target_id, tag, role, elem_type, enabled, element_info)
+
+    if action_type == "click":
+        return _validate_click_target(target_id, tag, role, elem_type, enabled, element_info)
+
+    return TargetValidation("valid", target_id, action_type, reason="无需验证")
+
+
+def _validate_type_target(target_id: str, tag: str, role: str, elem_type: str,
+                          enabled: bool, info: dict) -> TargetValidation:
+    """验证 type 动作的目标。"""
+    # 明确排除：button/submit/checkbox/radio/file/hidden
+    if elem_type in EXCLUDED_TYPES_FOR_TYPE:
+        return TargetValidation("invalid", target_id, "type",
+                                reason=f"type 目标不能是 input[{elem_type}]",
+                                tag=tag, role=role)
+
+    if tag == "input":
+        if not enabled:
+            return TargetValidation("invalid", target_id, "type", reason="输入框已禁用",
+                                    tag=tag, role=role, enabled=False)
+        return TargetValidation("valid", target_id, "type", reason="input 输入框", tag=tag, role=role)
+
+    if tag == "textarea":
+        if not enabled:
+            return TargetValidation("invalid", target_id, "type", reason="文本域已禁用",
+                                    tag=tag, role=role, enabled=False)
+        return TargetValidation("valid", target_id, "type", reason="textarea 文本域", tag=tag, role=role)
+
+    # contenteditable
+    if info.get("contenteditable"):
+        return TargetValidation("valid", target_id, "type", reason="contenteditable 元素", tag=tag, role=role)
+
+    # role=textbox 但不满足以上条件 → 可疑但执行
+    if role in ("textbox", "searchbox", "combobox"):
+        return TargetValidation("valid", target_id, "type", reason=f"role={role} 元素", tag=tag, role=role)
+
+    # 明确不匹配：type + button
+    if tag == "button" or role == "button":
+        return TargetValidation("invalid", target_id, "type",
+                                reason=f"type 目标不能是 button",
+                                tag=tag, role=role)
+
+    # 其他情况 → unknown（不阻断）
+    return TargetValidation("unknown", target_id, "type", reason=f"非标准输入元素 ({tag})",
+                            tag=tag, role=role)
+
+
+def _validate_click_target(target_id: str, tag: str, role: str, elem_type: str,
+                           enabled: bool, info: dict) -> TargetValidation:
+    """验证 click 动作的目标。"""
+    if tag == "input" and elem_type in ("hidden",):
+        return TargetValidation("invalid", target_id, "click", reason="hidden input 不可点击",
+                                tag=tag, role=role, visible=False)
+
+    if tag == "input" and elem_type in ("button", "submit", "checkbox", "radio", "file"):
+        return TargetValidation("valid", target_id, "click", reason=f"input[{elem_type}] 可点击",
+                                tag=tag, role=role)
+
+    if tag in ALLOWED_TAGS_FOR_CLICK:
+        return TargetValidation("valid", target_id, "click", reason=f"<{tag}> 可点击", tag=tag, role=role)
+
+    if role in ALLOWED_ROLES_FOR_CLICK:
+        return TargetValidation("valid", target_id, "click", reason=f"role={role} 可点击", tag=tag, role=role)
+
+    # 普通 div/span 等 → unknown（不阻断，可能有 JS click handler）
+    return TargetValidation("unknown", target_id, "click", reason=f"非标准交互元素 (<{tag}>)",
+                            tag=tag, role=role)
+
+
 # ── Agent Runner ───────────────────────────────────────────────────────────
 
 
@@ -855,6 +990,11 @@ class AgentRunner:
         # off | shadow | active — 默认 off
         self._no_effect_counts: dict[str, int] = {}  # action_signature → 计数
         self._last_action_signature: str = ""  # 上一步的动作签名，用于重置
+
+        # C3-1：动作前 target 验证配置
+        self._action_guard_mode = os.environ.get("AGENT_ACTION_GUARD", "off").lower()
+        # off | shadow | active — 默认 off
+        # active 只拦截明确 invalid，unknown 放行
 
         # P8-D：可观测性配置
         self._observability = os.environ.get("AGENT_OBSERVABILITY", "stderr").lower()
@@ -936,7 +1076,24 @@ class AgentRunner:
             else:
                 before = None
 
-            # 8. 执行
+            # 8. C3-1：动作前 target 验证（shadow / active）
+            action_guard_result = await self._validate_action_target(decision)
+            if (self._action_guard_mode == "active"
+                    and action_guard_result is not None
+                    and action_guard_result.status == "invalid"):
+                # 明确无效目标：不执行，强制 reobserve，回到 LLM 重新决策
+                _log(f"  [action_guard] 拦截无效目标: {action_guard_result.reason}")
+                self.attempted.add(decision.target_id)
+                history_entry = {
+                    "step": step,
+                    "action": decision.to_action_dict(),
+                    "success": False,
+                    "error": f"action_guard: {action_guard_result.reason}",
+                }
+                self.history.append(history_entry)
+                continue
+
+            # 9. 执行
             result = await self._execute(decision.to_action_dict())
 
             # 9. 阶段 3：shadow 验证后置快照 + diff + verify（仅记录）
@@ -1437,6 +1594,70 @@ class AgentRunner:
             return None
 
         return None
+
+    # ── C3-1：动作前 target 验证 ────────────────────────────────────────
+
+    async def _fetch_element_info(self, target_id: str) -> dict | None:
+        """读取目标元素的 DOM 信息（tag/role/visible/enabled/connected）。
+
+        用于 execute 前验证。页面正在导航时返回 None（unknown）。
+        """
+        expr = r"""
+        (() => {
+          const el = document.querySelector('[data-agent-id="%s"]');
+          if (!el) return null;
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return {
+            tag: el.tagName.toLowerCase(),
+            role: el.getAttribute('role') || '',
+            type: el.getAttribute('type') || '',
+            visible: rect.width > 0 && rect.height > 0 &&
+                     style.display !== 'none' &&
+                     style.visibility !== 'hidden',
+            enabled: !el.disabled,
+            connected: el.isConnected,
+            contenteditable: el.isContentEditable || false,
+          };
+        })()
+        """ % target_id.replace('"', '\\"')
+        try:
+            val = await self._evaluate_parse(expr)
+            return val if isinstance(val, dict) else None
+        except Exception:
+            return None
+
+    async def _validate_action_target(self, decision: Decision) -> TargetValidation | None:
+        """执行前验证目标元素。只有 action_guard_mode 非 off 时执行。
+
+        返回 None 表示无需验证（如 evaluate/stop/pause 等不需要 target 的动作）。
+        """
+        if self._action_guard_mode == "off":
+            return None
+
+        action_type = decision.action_type
+        target_id = decision.target_id
+
+        # 不需要 target 的动作
+        if action_type in ("stop", "pause", "evaluate", "download_setup", "navigate"):
+            return None
+
+        if not target_id:
+            return TargetValidation("invalid", "", action_type, reason="target_id 为空")
+
+        # 读取元素信息
+        info = await self._fetch_element_info(target_id)
+        result = validate_target(target_id, action_type, info)
+
+        # 日志
+        if self._action_guard_mode != "off":
+            _log(
+                f"  [action_guard] mode={self._action_guard_mode} "
+                f"action={action_type} target={target_id} "
+                f"status={result.status} reason={result.reason or ''}"
+            )
+
+        return result
 
     # ── 阶段 6A：Checkpoint / Pause / Resume ──────────────────────────────
 
