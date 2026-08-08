@@ -133,6 +133,27 @@ where
         .map_err(Into::into)
 }
 
+/// 判断 CDP 错误是否为可重试的暂时性传输/解析错误。
+/// C4-B：只对幂等读取操作重试，避免副作用动作（click/set_value/navigate）
+/// 因重复执行造成重复提交。
+fn is_retryable_cdp_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    // 分块/解析错误：chromiumoxide 的 "Separator is not found" / "chunk exceed the limit"
+    msg.contains("separator is not found")
+        || msg.contains("chunk exceed the limit")
+        || msg.contains("separator is found, but chunk is longer than limit")
+        || msg.contains("chunk is longer than limit")
+        || msg.contains("chunk")
+        || msg.contains("parse error")
+        || msg.contains("invalid response")
+        || msg.contains("incomplete")
+        || msg.contains("connection reset")
+        || msg.contains("broken pipe")
+}
+
+/// C4-B：只读 CDP 操作带重试的辅助函数已内联到 evaluate_with_retry 和
+/// extract_tree 中，避免副作用动作（click/set_value/navigate）被重试。
+
 // ═══════════════════════════════════════════════════════════════════════
 // Windows Job Object — M-01 fix: RAII wrapper with LazyLock
 // ═══════════════════════════════════════════════════════════════════════
@@ -1128,16 +1149,40 @@ impl BrowserState {
                 .build()
                 .map_err(|e| anyhow::anyhow!("Failed to build EvaluateParams: {}", e))?;
 
-            let tree_result = match tokio::time::timeout(EVALUATE_TIMEOUT, page.execute(extract_eval)).await {
-                Ok(Ok(resp)) => {
-                    resp.result
-                        .result
-                        .value
-                        .and_then(|v| v.as_str().map(|s| s.to_string()))
-                        .unwrap_or_default()
+            let tree_result = {
+                let mut tree_value = String::new();
+                // 第一次尝试
+                match tokio::time::timeout(EVALUATE_TIMEOUT, page.execute(extract_eval)).await {
+                    Ok(Ok(resp)) => {
+                        tree_value = resp.result.result.value
+                            .and_then(|v| v.as_str().map(|s| s.to_string()))
+                            .unwrap_or_default();
+                    }
+                    Ok(Err(e)) => {
+                        // C4-B：树提取失败且为可重试的 chunk/parse 错误时，重试一次
+                        if is_retryable_cdp_error(&anyhow::anyhow!("{}", e)) {
+                            eprintln!("[tree] extract chunk error on frame {}, retrying once", frame_idx);
+                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            let retry_eval = EvaluateParams::builder()
+                                .expression(EXTRACT_TREE_SCRIPT)
+                                .context_id(ctx_id)
+                                .return_by_value(true)
+                                .await_promise(true)
+                                .build()
+                                .map_err(|e| anyhow::anyhow!("Failed to build EvaluateParams: {}", e))?;
+                            match tokio::time::timeout(EVALUATE_TIMEOUT, page.execute(retry_eval)).await {
+                                Ok(Ok(resp2)) => {
+                                    tree_value = resp2.result.result.value
+                                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                                        .unwrap_or_default();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(_) => {}
                 }
-                Ok(Err(_)) => continue,
-                Err(_) => continue,
+                tree_value
             };
 
             if !tree_result.is_empty() {
@@ -1617,18 +1662,46 @@ impl BrowserState {
     /// Evaluate arbitrary JavaScript on the current page and return the result as a string.
     /// This bypasses the 50-char truncation of extract_tree for links and other elements.
     pub async fn evaluate(&self, expression: &str) -> Result<String> {
-        let page = lock_with_timeout(&self.page, "page").await?.clone();
         let script = format!(
             r#"(() => {{ try {{ return JSON.stringify({}); }} catch(e) {{ return JSON.stringify({{error: e.message}}); }} }})()"#,
             expression
         );
-        let result = evaluate_with_timeout(&page, &script).await?;
+        // C4-B：使用带重试的只读 evaluate 调用
+        let result = self.evaluate_with_retry(&script).await?;
         let value = result.value().cloned().unwrap_or(serde_json::Value::String("null".to_string()));
         let raw = match value {
             serde_json::Value::String(s) => s,
             other => other.to_string(),
         };
         Ok(raw)
+    }
+
+    /// C4-B：只读 Runtime.evaluate 带有限重试。
+    /// 对 chunk/parse 错误重试一次，副作用动作不应使用此方法。
+    async fn evaluate_with_retry(&self, script: &str) -> Result<chromiumoxide::js::EvaluationResult> {
+        // 第一次尝试
+        let page = lock_with_timeout(&self.page, "page").await?.clone();
+        match evaluate_with_timeout(&page, script).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if is_retryable_cdp_error(&e) {
+                    eprintln!("[cdp] Runtime.evaluate error=chunk/parse attempt=1 retryable=true — retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    let page2 = lock_with_timeout(&self.page, "page").await?.clone();
+                    match evaluate_with_timeout(&page2, script).await {
+                        Ok(v) => {
+                            eprintln!("[cdp] Runtime.evaluate retry=1 result=success");
+                            return Ok(v);
+                        }
+                        Err(e2) => {
+                            eprintln!("[cdp] Runtime.evaluate retry=1 result=failed: {}", e2);
+                            return Err(e2);
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Wait for an element to appear on the page, by target_id, text content, or CSS selector.
